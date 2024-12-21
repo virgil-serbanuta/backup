@@ -8,6 +8,7 @@
 .ccache/
 .cups/
 .dvdcss/
+.elan/
 .emulator_console_auth_token
 .gnuplot_history
 .gradle/
@@ -35,6 +36,9 @@ Movies/
 Music/
 Pictures/
 Public/
+bazel-bin
+bazel-out
+bazel-testlogs
 poze-Gabi/
 tmp/
 

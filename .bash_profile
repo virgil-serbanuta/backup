@@ -51,3 +51,5 @@ export PATH="$PATH:/Users/virgil/Library/Application Support/Coursier/bin"
 
 export PATH="${HOME}/multiversx-sdk:${PATH}"
 
+
+export PATH="$HOME/.elan/bin:$PATH"
