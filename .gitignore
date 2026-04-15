@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Poetry
+poetry.lock
+
+# Editor/OS
+.DS_Store
+.vscode/
