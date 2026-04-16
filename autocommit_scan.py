@@ -245,10 +245,11 @@ def stash_selected_paths(repo: Path, files: list[str]) -> str:
     if "No local changes to save" in out:
         raise AutocommitError("No changes available to stash for '#new' backup flow", repo=repo)
 
-    stash_commit = run_git(repo, ["rev-parse", "--verify", "refs/stash"]).stdout.strip()
-    if not stash_commit:
+    stash_ref = "stash@{0}"
+    verify = run_git(repo, ["stash", "list", "-1", stash_ref], check=False)
+    if verify.returncode != 0 or not verify.stdout.strip():
         raise AutocommitError("Unable to resolve stash reference after stashing", repo=repo)
-    return stash_commit
+    return stash_ref
 
 
 def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str]) -> None:
