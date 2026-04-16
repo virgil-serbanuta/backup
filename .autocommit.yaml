@@ -1,0 +1,5 @@
+commit type: all
+commit branch: "#new"
+max-size: 10485760
+max-files: 200
+push: false
