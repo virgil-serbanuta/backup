@@ -330,7 +330,8 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
         run_git(repo, ["commit", "-m", commit_message, "--", *files_to_commit])
         print(f"[{repo}] Commit created on branch {target_branch}")
 
-        if cfg.push:
+        should_push = cfg.push or cfg.commit_branch == "#new"
+        if should_push:
             if cfg.commit_branch == "#new":
                 run_git(repo, ["push", "-u", "origin", target_branch])
             else:
@@ -366,10 +367,10 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
     if not dirty_all:
         return
 
-    marker = repo / ".autocommit"
+    marker = repo / ".autocommit.yaml"
     if not marker.exists():
         print(
-            f"[{repo}] Dirty repository has no .autocommit marker; skipping."
+            f"[{repo}] Dirty repository has no .autocommit.yaml marker; skipping."
             f" Examples:{format_examples(dirty_all)}"
         )
         return
