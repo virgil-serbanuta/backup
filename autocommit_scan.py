@@ -256,78 +256,86 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
     commit_message = f"chore(backup): automatic commit {now}"
 
     original_branch = current_branch(repo)
+    new_branch: str | None = None
     created_new_branch = False
-    stashed_paths = False
     stash_ref: str | None = None
+    stash_applied = False
+    files_staged = False
 
     if not files_to_commit:
         print(f"[{repo}] No files left to commit after filters")
         return
 
-    if cfg.commit_branch == "#new":
-        previous_backup = latest_backup_branch(repo)
-        base_ref = previous_backup or original_branch
-
-        add_files(repo, files_to_commit)
-
-        has_staged = run_git(repo, ["diff", "--cached", "--quiet", "--", *files_to_commit], check=False)
-        if has_staged.returncode == 0:
-            print(f"[{repo}] No files left to commit after filters")
-            return
-        if has_staged.returncode not in (0, 1):
-            stderr = has_staged.stderr.strip() or has_staged.stdout.strip() or "unknown git error"
-            raise AutocommitError(f"git diff --cached --quiet failed: {stderr}", repo=repo)
-
-        if previous_backup is not None:
-            differs_from_last_backup = run_git(
-                repo,
-                ["diff", "--cached", "--quiet", previous_backup, "--", *files_to_commit],
-                check=False,
-            )
-            if differs_from_last_backup.returncode == 0:
-                unstage_files(repo, files_to_commit)
-                print(
-                    f"[{repo}] Skipping backup: current contents match latest backup branch {previous_backup}"
-                )
-                return
-            if differs_from_last_backup.returncode not in (0, 1):
-                stderr = (
-                    differs_from_last_backup.stderr.strip()
-                    or differs_from_last_backup.stdout.strip()
-                    or "unknown git error"
-                )
-                raise AutocommitError(f"git diff --cached --quiet against {previous_backup} failed: {stderr}", repo=repo)
-
-        stash_ref = stash_selected_paths(repo, files_to_commit)
-        stashed_paths = True
-
-        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        new_branch = f"backup/{ts}"
-        # TODO: remove old backup/* branches based on retention policy.
-        run_git(repo, ["checkout", "-b", new_branch, base_ref])
-        run_git(repo, ["stash", "apply", "--index", stash_ref])
-        target_branch = new_branch
-        created_new_branch = True
-    else:
-        target_branch = cfg.commit_branch
-        if original_branch != target_branch:
-            raise AutocommitError(
-                f"Current branch is '{original_branch}', expected '{target_branch}'",
-                repo=repo,
-            )
-
-        add_files(repo, files_to_commit)
-
-        has_staged = run_git(repo, ["diff", "--cached", "--quiet", "--", *files_to_commit], check=False)
-        if has_staged.returncode == 0:
-            print(f"[{repo}] No files left to commit after filters")
-            return
-        if has_staged.returncode not in (0, 1):
-            stderr = has_staged.stderr.strip() or has_staged.stdout.strip() or "unknown git error"
-            raise AutocommitError(f"git diff --cached --quiet failed: {stderr}", repo=repo)
-
     try:
+        if cfg.commit_branch == "#new":
+            previous_backup = latest_backup_branch(repo)
+            base_ref = previous_backup or original_branch
+
+            add_files(repo, files_to_commit)
+            files_staged = True
+
+            has_staged = run_git(repo, ["diff", "--cached", "--quiet", "--", *files_to_commit], check=False)
+            if has_staged.returncode == 0:
+                print(f"[{repo}] No files left to commit after filters")
+                return
+            if has_staged.returncode not in (0, 1):
+                stderr = has_staged.stderr.strip() or has_staged.stdout.strip() or "unknown git error"
+                raise AutocommitError(f"git diff --cached --quiet failed: {stderr}", repo=repo)
+
+            if previous_backup is not None:
+                differs_from_last_backup = run_git(
+                    repo,
+                    ["diff", "--cached", "--quiet", previous_backup, "--", *files_to_commit],
+                    check=False,
+                )
+                if differs_from_last_backup.returncode == 0:
+                    unstage_files(repo, files_to_commit)
+                    files_staged = False
+                    print(
+                        f"[{repo}] Skipping backup: current contents match latest backup branch {previous_backup}"
+                    )
+                    return
+                if differs_from_last_backup.returncode not in (0, 1):
+                    stderr = (
+                        differs_from_last_backup.stderr.strip()
+                        or differs_from_last_backup.stdout.strip()
+                        or "unknown git error"
+                    )
+                    raise AutocommitError(f"git diff --cached --quiet against {previous_backup} failed: {stderr}", repo=repo)
+
+            stash_ref = stash_selected_paths(repo, files_to_commit)
+            files_staged = False
+
+            ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            new_branch = f"backup/{ts}"
+            # TODO: remove old backup/* branches based on retention policy.
+            run_git(repo, ["checkout", "-b", new_branch, base_ref])
+            created_new_branch = True
+
+            run_git(repo, ["stash", "apply", "--index", stash_ref])
+            stash_applied = True
+            target_branch = new_branch
+        else:
+            target_branch = cfg.commit_branch
+            if original_branch != target_branch:
+                raise AutocommitError(
+                    f"Current branch is '{original_branch}', expected '{target_branch}'",
+                    repo=repo,
+                )
+
+            add_files(repo, files_to_commit)
+            files_staged = True
+
+            has_staged = run_git(repo, ["diff", "--cached", "--quiet", "--", *files_to_commit], check=False)
+            if has_staged.returncode == 0:
+                print(f"[{repo}] No files left to commit after filters")
+                return
+            if has_staged.returncode not in (0, 1):
+                stderr = has_staged.stderr.strip() or has_staged.stdout.strip() or "unknown git error"
+                raise AutocommitError(f"git diff --cached --quiet failed: {stderr}", repo=repo)
+
         run_git(repo, ["commit", "-m", commit_message, "--", *files_to_commit])
+        files_staged = False
         print(f"[{repo}] Commit created on branch {target_branch}")
 
         if cfg.push:
@@ -337,27 +345,39 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
                 run_git(repo, ["push"])
             print(f"[{repo}] Push successful")
     except Exception:
-        if created_new_branch:
+        # If stash was applied to new_branch, reset it so checkout back is clean.
+        if stash_applied and new_branch is not None:
+            try:
+                run_git(repo, ["reset", "--hard", "HEAD"])
+            except AutocommitError as exc:
+                print(f"WARNING [{repo}]: failed to reset --hard on '{new_branch}': {exc}", file=sys.stderr)
+        # Return to original branch and remove the new branch.
+        if created_new_branch and new_branch is not None:
             try:
                 run_git(repo, ["checkout", original_branch])
-            except AutocommitError as checkout_exc:
-                print(
-                    f"WARNING [{repo}]: failed to restore original branch '{original_branch}': {checkout_exc}",
-                    file=sys.stderr,
-                )
-        if stashed_paths and stash_ref is not None:
+            except AutocommitError as exc:
+                print(f"WARNING [{repo}]: failed to restore original branch '{original_branch}': {exc}", file=sys.stderr)
+            try:
+                run_git(repo, ["branch", "-D", new_branch])
+            except AutocommitError as exc:
+                print(f"WARNING [{repo}]: failed to delete branch '{new_branch}': {exc}", file=sys.stderr)
+        # Restore stashed files (stash was not applied, or was applied then reset above).
+        if stash_ref is not None:
             try:
                 run_git(repo, ["stash", "pop", "--index", stash_ref])
-            except AutocommitError as stash_exc:
-                print(
-                    f"WARNING [{repo}]: failed to restore stashed files on '{original_branch}': {stash_exc}",
-                    file=sys.stderr,
-                )
+            except AutocommitError as exc:
+                print(f"WARNING [{repo}]: failed to restore stash on '{original_branch}': {exc}", file=sys.stderr)
+        # Unstage files that were staged but not consumed by a stash or commit.
+        if files_staged:
+            try:
+                run_git(repo, ["reset", "-q", "--", *files_to_commit])
+            except AutocommitError as exc:
+                print(f"WARNING [{repo}]: failed to unstage files: {exc}", file=sys.stderr)
         raise
     else:
         if created_new_branch:
             run_git(repo, ["checkout", original_branch])
-        if stashed_paths and stash_ref is not None:
+        if stash_ref is not None:
             run_git(repo, ["stash", "pop", "--index", stash_ref])
 
 
@@ -366,10 +386,10 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
     if not dirty_all:
         return
 
-    marker = repo / ".autocommit"
+    marker = repo / ".autocommit.yaml"
     if not marker.exists():
         print(
-            f"[{repo}] Dirty repository has no .autocommit marker; skipping."
+            f"[{repo}] Dirty repository has no .autocommit.yaml marker; skipping."
             f" Examples:{format_examples(dirty_all)}"
         )
         return
