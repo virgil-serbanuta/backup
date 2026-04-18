@@ -10,6 +10,12 @@ package-mode = false
 python = "^3.10"
 PyYAML = "^6.0.2"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+
 [build-system]
 requires = ["poetry-core>=1.9.0"]
 build-backend = "poetry.core.masonry.api"

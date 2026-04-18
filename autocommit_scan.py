@@ -245,10 +245,12 @@ def stash_selected_paths(repo: Path, files: list[str]) -> str:
     if "No local changes to save" in out:
         raise AutocommitError("No changes available to stash for '#new' backup flow", repo=repo)
 
-    stash_commit = run_git(repo, ["rev-parse", "--verify", "refs/stash"]).stdout.strip()
-    if not stash_commit:
-        raise AutocommitError("Unable to resolve stash reference after stashing", repo=repo)
-    return stash_commit
+    # Verify the stash was actually created before returning a reference to it.
+    verify = run_git(repo, ["rev-parse", "--verify", "refs/stash"], check=False)
+    if verify.returncode != 0 or not verify.stdout.strip():
+        raise AutocommitError("Unable to verify stash was created", repo=repo)
+    # A fresh stash push always lands at stash@{0}.
+    return "stash@{0}"
 
 
 def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str]) -> None:
@@ -312,7 +314,10 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
             run_git(repo, ["checkout", "-b", new_branch, base_ref])
             created_new_branch = True
 
-            run_git(repo, ["stash", "apply", "--index", stash_ref])
+            # Use checkout instead of stash apply to avoid index conflicts when
+            # a file that is untracked on the current branch is already tracked
+            # on the base (previous backup) branch.
+            run_git(repo, ["checkout", stash_ref, "--", *files_to_commit])
             stash_applied = True
             target_branch = new_branch
         else:
@@ -364,9 +369,16 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
         # Restore stashed files (stash was not applied, or was applied then reset above).
         if stash_ref is not None:
             try:
-                run_git(repo, ["stash", "pop", "--index", stash_ref])
+                run_git(repo, ["stash", "pop", stash_ref])
             except AutocommitError as exc:
                 print(f"WARNING [{repo}]: failed to restore stash on '{original_branch}': {exc}", file=sys.stderr)
+            else:
+                # stash pop may re-stage files (we staged them before stashing);
+                # restore the original unstaged/untracked state.
+                try:
+                    unstage_files(repo, files_to_commit)
+                except AutocommitError as exc:
+                    print(f"WARNING [{repo}]: failed to unstage after stash pop: {exc}", file=sys.stderr)
         # Unstage files that were staged but not consumed by a stash or commit.
         if files_staged:
             try:
@@ -378,7 +390,9 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
         if created_new_branch:
             run_git(repo, ["checkout", original_branch])
         if stash_ref is not None:
-            run_git(repo, ["stash", "pop", "--index", stash_ref])
+            run_git(repo, ["stash", "pop", stash_ref])
+            # stash pop may re-stage files; restore original unstaged/untracked state.
+            unstage_files(repo, files_to_commit)
 
 
 def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: list[str]) -> None:

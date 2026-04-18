@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""Tests for autocommit_scan.py.
+
+Each test that touches git creates its own repository tree under pytest's
+tmp_path so tests are fully isolated and leave no side effects.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+import yaml
+
+# Make sure the module is importable when running from the project root.
+sys.path.insert(0, str(Path(__file__).parent))
+
+import autocommit_scan
+from autocommit_scan import (
+    AutocommitError,
+    RepoConfig,
+    cap_by_max_files,
+    commit_and_maybe_push,
+    current_branch,
+    discover_repositories,
+    ensure_nested_repos_ignored,
+    ensure_root_repo,
+    filter_by_max_size,
+    format_examples,
+    load_repo_config,
+    process_repository,
+    tracked_changed_files,
+    untracked_files,
+)
+
+# ---------------------------------------------------------------------------
+# Git / repo helpers
+# ---------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, text=True, capture_output=True,
+    )
+
+
+def make_repo(path: Path, branch: str = "master") -> Path:
+    """Create a git repo with one initial commit so HEAD exists."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-b", branch)
+    _git(path, "config", "user.email", "test@example.com")
+    _git(path, "config", "user.name", "Test User")
+    _git(path, "config", "commit.gpgsign", "false")
+    (path / ".gitkeep").write_text("")
+    _git(path, "add", ".gitkeep")
+    _git(path, "commit", "-m", "init")
+    return path
+
+
+def write_autocommit_yaml(
+    repo: Path,
+    *,
+    commit_branch: str = "master",
+    commit_type: str = "changed",
+    max_size: int = 10 ** 9,
+    max_files: int = 1000,
+    push: bool = False,
+) -> None:
+    cfg = {
+        "commit type": commit_type,
+        "commit branch": commit_branch,
+        "max-size": max_size,
+        "max-files": max_files,
+        "push": push,
+    }
+    (repo / ".autocommit.yaml").write_text(yaml.dump(cfg))
+
+
+def make_cfg(
+    commit_branch: str = "master",
+    commit_type: str = "changed",
+    max_size: int = 10 ** 9,
+    max_files: int = 1000,
+    push: bool = False,
+) -> RepoConfig:
+    return RepoConfig(
+        commit_type=commit_type,
+        commit_branch=commit_branch,
+        max_size=max_size,
+        max_files=max_files,
+        push=push,
+    )
+
+
+def staged_files(repo: Path) -> list[str]:
+    """Return names of files that have staged changes (X column non-space/?)."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, text=True, capture_output=True,
+    )
+    result = []
+    for line in proc.stdout.splitlines():
+        if line and line[0] not in (" ", "?"):
+            result.append(line[3:].strip())
+    return result
+
+
+def backup_branches(repo: Path) -> list[str]:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "backup/*"],
+        check=True, text=True, capture_output=True,
+    )
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def stash_count(repo: Path) -> int:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "stash", "list"],
+        check=True, text=True, capture_output=True,
+    )
+    return len([l for l in proc.stdout.splitlines() if l.strip()])
+
+
+# ---------------------------------------------------------------------------
+# Pure function tests
+# ---------------------------------------------------------------------------
+
+class TestFormatExamples:
+    def test_empty(self):
+        assert format_examples([]) == ""
+
+    def test_few_items(self):
+        assert format_examples(["a", "b"]) == "\n  a\n  b"
+
+    def test_exactly_max(self):
+        result = format_examples(["a"] * 5)
+        assert "..." not in result
+
+    def test_truncated_at_default(self):
+        result = format_examples(["a"] * 6)
+        assert "..." in result
+        assert result.count("\n  a") == 5
+
+    def test_custom_max_items(self):
+        result = format_examples(["x", "y", "z"], max_items=2)
+        assert "..." in result
+        assert "z" not in result
+
+
+class TestCapByMaxFiles:
+    def test_zero_keeps_nothing(self):
+        kept, over = cap_by_max_files(["a", "b"], 0)
+        assert kept == []
+        assert over == ["a", "b"]
+
+    def test_within_limit(self):
+        kept, over = cap_by_max_files(["a", "b"], 10)
+        assert kept == ["a", "b"]
+        assert over == []
+
+    def test_at_exact_limit(self):
+        kept, over = cap_by_max_files(["a", "b"], 2)
+        assert kept == ["a", "b"]
+        assert over == []
+
+    def test_over_limit(self):
+        kept, over = cap_by_max_files(["a", "b", "c"], 2)
+        assert kept == ["a", "b"]
+        assert over == ["c"]
+
+
+class TestStatusLineParsers:
+    def test_tracked_changed_skips_untracked(self):
+        lines = ["?? new.txt", " M modified.txt"]
+        assert tracked_changed_files(Path("."), lines) == ["modified.txt"]
+
+    def test_tracked_changed_follows_rename(self):
+        lines = ["R  old.txt -> new.txt"]
+        assert tracked_changed_files(Path("."), lines) == ["new.txt"]
+
+    def test_tracked_changed_deduplicates(self):
+        lines = [" M a.txt", "M  a.txt"]
+        assert tracked_changed_files(Path("."), lines) == ["a.txt"]
+
+    def test_untracked_skips_tracked(self):
+        lines = ["?? foo.txt", " M bar.txt"]
+        assert untracked_files(lines) == ["foo.txt"]
+
+    def test_untracked_deduplicates(self):
+        lines = ["?? foo.txt", "?? foo.txt"]
+        assert untracked_files(lines) == ["foo.txt"]
+
+
+# ---------------------------------------------------------------------------
+# ensure_root_repo
+# ---------------------------------------------------------------------------
+
+class TestEnsureRootRepo:
+    def test_valid_root(self, tmp_path):
+        _git(tmp_path, "init")
+        assert ensure_root_repo(tmp_path) == tmp_path.resolve()
+
+    def test_not_a_git_repo(self, tmp_path):
+        with pytest.raises(AutocommitError, match="not a git repository"):
+            ensure_root_repo(tmp_path)
+
+    def test_subdir_of_repo(self, tmp_path):
+        _git(tmp_path, "init")
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        with pytest.raises(AutocommitError, match="not its root"):
+            ensure_root_repo(subdir)
+
+
+# ---------------------------------------------------------------------------
+# discover_repositories
+# ---------------------------------------------------------------------------
+
+class TestDiscoverRepositories:
+    def test_single_repo(self, tmp_path):
+        make_repo(tmp_path)
+        assert discover_repositories(tmp_path) == [tmp_path.resolve()]
+
+    def test_nested_repo_discovered(self, tmp_path):
+        make_repo(tmp_path)
+        nested = tmp_path / "child"
+        make_repo(nested)
+        repos = discover_repositories(tmp_path)
+        assert tmp_path.resolve() in repos
+        assert nested.resolve() in repos
+        assert len(repos) == 2
+
+    def test_does_not_descend_into_git_internals(self, tmp_path):
+        make_repo(tmp_path)
+        repos = discover_repositories(tmp_path)
+        assert all(".git" not in str(r) for r in repos)
+
+    def test_deeply_nested(self, tmp_path):
+        make_repo(tmp_path)
+        deep = tmp_path / "a" / "b" / "c"
+        make_repo(deep)
+        repos = discover_repositories(tmp_path)
+        assert deep.resolve() in repos
+
+
+# ---------------------------------------------------------------------------
+# ensure_nested_repos_ignored
+# ---------------------------------------------------------------------------
+
+class TestEnsureNestedReposIgnored:
+    def test_ignored_nested_repo_passes(self, tmp_path):
+        root = make_repo(tmp_path / "root")
+        nested = make_repo(root / "nested")
+        (root / ".gitignore").write_text("nested/\n")
+        _git(root, "add", ".gitignore")
+        _git(root, "commit", "-m", "add gitignore")
+        ensure_nested_repos_ignored(root, [root, nested])  # must not raise
+
+    def test_non_ignored_nested_repo_raises(self, tmp_path):
+        root = make_repo(tmp_path / "root")
+        nested = make_repo(root / "nested")
+        with pytest.raises(AutocommitError, match="not ignored"):
+            ensure_nested_repos_ignored(root, [root, nested])
+
+    def test_root_alone_always_passes(self, tmp_path):
+        root = make_repo(tmp_path)
+        ensure_nested_repos_ignored(root, [root])  # nothing to check
+
+
+# ---------------------------------------------------------------------------
+# load_repo_config
+# ---------------------------------------------------------------------------
+
+class TestLoadRepoConfig:
+    def test_valid_config(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_branch="master", commit_type="all",
+                              max_size=5000, max_files=50, push=True)
+        cfg = load_repo_config(repo)
+        assert cfg.commit_type == "all"
+        assert cfg.commit_branch == "master"
+        assert cfg.max_size == 5000
+        assert cfg.max_files == 50
+        assert cfg.push is True
+
+    def test_hash_new_branch_is_valid(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_branch="#new")
+        cfg = load_repo_config(repo)
+        assert cfg.commit_branch == "#new"
+
+    def test_missing_file_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        with pytest.raises(AutocommitError, match="Missing"):
+            load_repo_config(repo)
+
+    def test_invalid_commit_type_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / ".autocommit.yaml").write_text(
+            "commit type: wrong\ncommit branch: master\n"
+            "max-size: 0\nmax-files: 0\npush: false\n"
+        )
+        with pytest.raises(AutocommitError, match="commit type"):
+            load_repo_config(repo)
+
+    def test_invalid_branch_name_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / ".autocommit.yaml").write_text(
+            "commit type: changed\ncommit branch: 'bad branch'\n"
+            "max-size: 0\nmax-files: 0\npush: false\n"
+        )
+        with pytest.raises(AutocommitError, match="Invalid git branch"):
+            load_repo_config(repo)
+
+    def test_negative_max_size_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / ".autocommit.yaml").write_text(
+            "commit type: changed\ncommit branch: master\n"
+            "max-size: -1\nmax-files: 0\npush: false\n"
+        )
+        with pytest.raises(AutocommitError, match="max-size"):
+            load_repo_config(repo)
+
+    def test_push_must_be_bool(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / ".autocommit.yaml").write_text(
+            "commit type: changed\ncommit branch: master\n"
+            "max-size: 0\nmax-files: 0\npush: yes-please\n"
+        )
+        with pytest.raises(AutocommitError, match="push"):
+            load_repo_config(repo)
+
+
+# ---------------------------------------------------------------------------
+# filter_by_max_size
+# ---------------------------------------------------------------------------
+
+class TestFilterByMaxSize:
+    def test_small_file_kept(self, tmp_path):
+        (tmp_path / "small.txt").write_text("x")
+        kept, large = filter_by_max_size(tmp_path, ["small.txt"], max_size=10)
+        assert kept == ["small.txt"]
+        assert large == []
+
+    def test_large_file_excluded(self, tmp_path):
+        (tmp_path / "big.txt").write_bytes(b"x" * 100)
+        kept, large = filter_by_max_size(tmp_path, ["big.txt"], max_size=10)
+        assert kept == []
+        assert large == ["big.txt"]
+
+    def test_missing_file_not_filtered(self, tmp_path):
+        # A deleted tracked file (not on disk) must still appear in the commit
+        kept, large = filter_by_max_size(tmp_path, ["gone.txt"], max_size=1)
+        assert kept == ["gone.txt"]
+        assert large == []
+
+    def test_exactly_at_limit_is_kept(self, tmp_path):
+        (tmp_path / "f.txt").write_bytes(b"x" * 10)
+        kept, large = filter_by_max_size(tmp_path, ["f.txt"], max_size=10)
+        assert kept == ["f.txt"]
+
+
+# ---------------------------------------------------------------------------
+# commit_and_maybe_push — normal (named) branch
+# ---------------------------------------------------------------------------
+
+class TestCommitNormalBranch:
+    def test_commits_tracked_modification(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("v1\n")
+        _git(repo, "add", "file.txt")
+        _git(repo, "commit", "-m", "add file")
+        (repo / "file.txt").write_text("v2\n")
+
+        commit_and_maybe_push(repo, make_cfg(), ["file.txt"])
+
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" in log
+        assert current_branch(repo) == "master"
+
+    def test_commits_new_untracked_file(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "new.txt").write_text("brand new\n")
+        commit_and_maybe_push(repo, make_cfg(), ["new.txt"])
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" in log
+
+    def test_wrong_branch_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "f.txt").write_text("x")
+        with pytest.raises(AutocommitError, match="expected 'other'"):
+            commit_and_maybe_push(repo, make_cfg(commit_branch="other"), ["f.txt"])
+
+    def test_empty_file_list_skips_commit(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        commit_and_maybe_push(repo, make_cfg(), [])
+        assert "No files left" in capsys.readouterr().out
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" not in log
+
+    def test_unstages_files_on_commit_error(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("change\n")
+
+        real = autocommit_scan.run_git
+        def failing(r, args, **kw):
+            if args[0] == "commit":
+                raise AutocommitError("injected failure", repo=r)
+            return real(r, args, **kw)
+        monkeypatch.setattr(autocommit_scan, "run_git", failing)
+
+        with pytest.raises(AutocommitError, match="injected failure"):
+            commit_and_maybe_push(repo, make_cfg(), ["file.txt"])
+
+        assert staged_files(repo) == []
+        assert current_branch(repo) == "master"
+        assert (repo / "file.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# commit_and_maybe_push — #new branch
+# ---------------------------------------------------------------------------
+
+class TestCommitNewBranch:
+    def test_creates_backup_branch(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+        branches = backup_branches(repo)
+        assert len(branches) == 1
+        assert branches[0].startswith("backup/")
+
+    def test_returns_to_original_branch(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+        assert current_branch(repo) == "master"
+
+    def test_restores_untracked_file_after_success(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+        # The file must be present and untracked on master again
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True, text=True, capture_output=True,
+        ).stdout
+        assert "file.txt" in status
+        assert staged_files(repo) == []
+        assert stash_count(repo) == 0
+
+    def test_restores_tracked_modification_after_success(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("original\n")
+        _git(repo, "add", "file.txt")
+        _git(repo, "commit", "-m", "add file")
+        (repo / "file.txt").write_text("modified\n")
+
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+
+        assert current_branch(repo) == "master"
+        assert (repo / "file.txt").read_text() == "modified\n"
+        assert stash_count(repo) == 0
+
+    def test_skips_if_same_as_previous_backup(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+        cfg = make_cfg(commit_branch="#new")
+        commit_and_maybe_push(repo, cfg, ["file.txt"])
+        capsys.readouterr()
+
+        commit_and_maybe_push(repo, cfg, ["file.txt"])
+
+        assert "Skipping backup" in capsys.readouterr().out
+        assert len(backup_branches(repo)) == 1
+
+    def test_creates_second_branch_when_content_differs(self, tmp_path):
+        repo = make_repo(tmp_path)
+        cfg = make_cfg(commit_branch="#new")
+        (repo / "file.txt").write_text("v1\n")
+        commit_and_maybe_push(repo, cfg, ["file.txt"])
+        time.sleep(1.1)  # branch names are second-granular; avoid collision
+        (repo / "file.txt").write_text("v2\n")
+        commit_and_maybe_push(repo, cfg, ["file.txt"])
+        assert len(backup_branches(repo)) == 2
+
+    def test_restores_state_on_commit_error(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+
+        real = autocommit_scan.run_git
+        def failing(r, args, **kw):
+            if args[0] == "commit":
+                raise AutocommitError("injected commit failure", repo=r)
+            return real(r, args, **kw)
+        monkeypatch.setattr(autocommit_scan, "run_git", failing)
+
+        with pytest.raises(AutocommitError, match="injected commit failure"):
+            commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+
+        assert current_branch(repo) == "master"
+        assert backup_branches(repo) == []
+        assert staged_files(repo) == []
+        assert (repo / "file.txt").read_text() == "data\n"
+        assert stash_count(repo) == 0
+
+    def test_restores_state_on_checkout_error(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+
+        real = autocommit_scan.run_git
+        def failing(r, args, **kw):
+            if args[0] == "checkout" and "-b" in args:
+                raise AutocommitError("injected checkout failure", repo=r)
+            return real(r, args, **kw)
+        monkeypatch.setattr(autocommit_scan, "run_git", failing)
+
+        with pytest.raises(AutocommitError, match="injected checkout failure"):
+            commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+
+        assert current_branch(repo) == "master"
+        assert backup_branches(repo) == []
+        assert staged_files(repo) == []
+        assert (repo / "file.txt").read_text() == "data\n"
+        assert stash_count(repo) == 0
+
+    def test_restores_state_on_stash_apply_error(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("data\n")
+
+        # The #new flow applies the stash via `git checkout stash@{0} -- files`.
+        # Intercept that specific call (it has "--" in args but not "-b").
+        real = autocommit_scan.run_git
+        def failing(r, args, **kw):
+            if args[0] == "checkout" and "--" in args and "-b" not in args:
+                raise AutocommitError("injected checkout-stash failure", repo=r)
+            return real(r, args, **kw)
+        monkeypatch.setattr(autocommit_scan, "run_git", failing)
+
+        with pytest.raises(AutocommitError, match="injected checkout-stash failure"):
+            commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
+
+        assert current_branch(repo) == "master"
+        assert backup_branches(repo) == []
+        assert staged_files(repo) == []
+        assert (repo / "file.txt").read_text() == "data\n"
+        assert stash_count(repo) == 0
+
+
+# ---------------------------------------------------------------------------
+# process_repository
+# ---------------------------------------------------------------------------
+
+class TestProcessRepository:
+    def test_skips_if_no_dirty_files(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        process_repository(repo, [], [])
+        assert capsys.readouterr().out == ""
+
+    def test_skips_if_no_config_file(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        process_repository(repo, ["file.txt"], [])
+        assert "no .autocommit.yaml marker" in capsys.readouterr().out
+
+    def test_commit_type_changed_ignores_untracked(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "untracked.txt").write_text("new\n")
+
+        process_repository(repo, [], ["untracked.txt"])
+
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" not in log
+
+    def test_commit_type_all_includes_untracked(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="all")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "untracked.txt").write_text("new\n")
+
+        process_repository(repo, [], ["untracked.txt"])
+
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" in log
+
+    def test_max_size_filters_large_file(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed", max_size=5)
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "big.txt").write_bytes(b"x" * 100)
+        _git(repo, "add", "big.txt")
+        _git(repo, "commit", "-m", "add big")
+        (repo / "big.txt").write_bytes(b"y" * 100)
+
+        process_repository(repo, ["big.txt"], [])
+
+        assert "max-size" in capsys.readouterr().out
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" not in log
+
+    def test_max_files_caps_commit(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed", max_files=1)
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        for i in range(3):
+            f = repo / f"file{i}.txt"
+            f.write_text("v1")
+            _git(repo, "add", str(f))
+            _git(repo, "commit", "-m", f"add {f.name}")
+            f.write_text("v2")
+
+        process_repository(repo, ["file0.txt", "file1.txt", "file2.txt"], [])
+
+        assert "max-files" in capsys.readouterr().out
+        # Only one file committed; the other two remain modified
+        log = _git(repo, "log", "--oneline").stdout
+        assert log.count("chore(backup)") == 1
+
+
+# ---------------------------------------------------------------------------
+# main() — end-to-end via direct call (mocking sys.argv)
+# ---------------------------------------------------------------------------
+
+class TestMain:
+    def test_non_git_dir_returns_1(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["prog", str(tmp_path)])
+        assert autocommit_scan.main() == 1
+
+    def test_subdir_of_repo_returns_1(self, tmp_path, monkeypatch):
+        make_repo(tmp_path)
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        monkeypatch.setattr(sys, "argv", ["prog", str(subdir)])
+        assert autocommit_scan.main() == 1
+
+    def test_clean_repo_returns_0_with_no_commit(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo)
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        monkeypatch.setattr(sys, "argv", ["prog", str(repo)])
+        assert autocommit_scan.main() == 0
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" not in log
+
+    def test_dirty_repo_commits_and_returns_0(self, tmp_path, monkeypatch):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo)
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "data.txt").write_text("v1\n")
+        _git(repo, "add", "data.txt")
+        _git(repo, "commit", "-m", "add data")
+        (repo / "data.txt").write_text("v2\n")
+
+        monkeypatch.setattr(sys, "argv", ["prog", str(repo)])
+        assert autocommit_scan.main() == 0
+        log = _git(repo, "log", "--oneline").stdout
+        assert "chore(backup)" in log
+
+    def test_nested_repo_not_ignored_returns_1(self, tmp_path, monkeypatch):
+        root = make_repo(tmp_path / "root")
+        _child = make_repo(root / "child")
+        monkeypatch.setattr(sys, "argv", ["prog", str(root)])
+        assert autocommit_scan.main() == 1
+
+    def test_nested_repo_ignored_both_processed(self, tmp_path, monkeypatch):
+        root = make_repo(tmp_path / "root")
+        child = make_repo(root / "child")
+
+        # Root ignores child
+        (root / ".gitignore").write_text("child/\n")
+        _git(root, "add", ".gitignore")
+        _git(root, "commit", "-m", "ignore child")
+
+        # Both repos have configs and dirty files
+        write_autocommit_yaml(root)
+        _git(root, "add", ".autocommit.yaml")
+        _git(root, "commit", "-m", "root config")
+        (root / "root_file.txt").write_text("v1\n")
+        _git(root, "add", "root_file.txt")
+        _git(root, "commit", "-m", "add root file")
+        (root / "root_file.txt").write_text("v2\n")
+
+        write_autocommit_yaml(child)
+        _git(child, "add", ".autocommit.yaml")
+        _git(child, "commit", "-m", "child config")
+        (child / "child_file.txt").write_text("v1\n")
+        _git(child, "add", "child_file.txt")
+        _git(child, "commit", "-m", "add child file")
+        (child / "child_file.txt").write_text("v2\n")
+
+        monkeypatch.setattr(sys, "argv", ["prog", str(root)])
+        result = autocommit_scan.main()
+        assert result == 0
+        assert "chore(backup)" in _git(root, "log", "--oneline").stdout
+        assert "chore(backup)" in _git(child, "log", "--oneline").stdout
