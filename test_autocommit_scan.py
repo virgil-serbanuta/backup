@@ -250,6 +250,19 @@ class TestDiscoverRepositories:
 # ensure_nested_repos_ignored
 # ---------------------------------------------------------------------------
 
+def add_submodule(parent: Path, sub_src: Path, rel_name: str) -> Path:
+    """Register sub_src as a submodule of parent at rel_name and commit."""
+    # -c protocol.file.allow=always is required on git ≥ 2.38.1 which blocks
+    # local file:// transport for submodule cloning by default.
+    subprocess.run(
+        ["git", "-C", str(parent), "-c", "protocol.file.allow=always",
+         "submodule", "add", str(sub_src), rel_name],
+        check=True, capture_output=True, text=True,
+    )
+    _git(parent, "commit", "-m", f"add submodule {rel_name}")
+    return parent / rel_name
+
+
 class TestEnsureNestedReposIgnored:
     def test_ignored_nested_repo_passes(self, tmp_path):
         root = make_repo(tmp_path / "root")
@@ -268,6 +281,18 @@ class TestEnsureNestedReposIgnored:
     def test_root_alone_always_passes(self, tmp_path):
         root = make_repo(tmp_path)
         ensure_nested_repos_ignored(root, [root])  # nothing to check
+
+    def test_submodule_passes_without_gitignore(self, tmp_path):
+        root = make_repo(tmp_path / "root")
+        sub_src = make_repo(tmp_path / "sub_src")
+        sub = add_submodule(root, sub_src, "sub")
+        ensure_nested_repos_ignored(root, [root, sub])  # must not raise
+
+    def test_non_ignored_non_submodule_still_raises(self, tmp_path):
+        root = make_repo(tmp_path / "root")
+        nested = make_repo(root / "nested")
+        with pytest.raises(AutocommitError, match="not ignored"):
+            ensure_nested_repos_ignored(root, [root, nested])
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +696,32 @@ class TestMain:
         _child = make_repo(root / "child")
         monkeypatch.setattr(sys, "argv", ["prog", str(root)])
         assert autocommit_scan.main() == 1
+
+    def test_submodule_processed_without_gitignore(self, tmp_path, monkeypatch):
+        root = make_repo(tmp_path / "root")
+        sub_src = make_repo(tmp_path / "sub_src")
+        sub = add_submodule(root, sub_src, "sub")
+
+        write_autocommit_yaml(root)
+        _git(root, "add", ".autocommit.yaml")
+        _git(root, "commit", "-m", "root config")
+        (root / "root_file.txt").write_text("v1\n")
+        _git(root, "add", "root_file.txt")
+        _git(root, "commit", "-m", "add root file")
+        (root / "root_file.txt").write_text("v2\n")
+
+        write_autocommit_yaml(sub)
+        _git(sub, "add", ".autocommit.yaml")
+        _git(sub, "commit", "-m", "sub config")
+        (sub / "sub_file.txt").write_text("v1\n")
+        _git(sub, "add", "sub_file.txt")
+        _git(sub, "commit", "-m", "add sub file")
+        (sub / "sub_file.txt").write_text("v2\n")
+
+        monkeypatch.setattr(sys, "argv", ["prog", str(root)])
+        assert autocommit_scan.main() == 0
+        assert "chore(backup)" in _git(root, "log", "--oneline").stdout
+        assert "chore(backup)" in _git(sub, "log", "--oneline").stdout
 
     def test_nested_repo_ignored_both_processed(self, tmp_path, monkeypatch):
         root = make_repo(tmp_path / "root")

@@ -87,12 +87,20 @@ def nearest_parent_repo(repos: list[Path], repo: Path) -> Path:
     return max(candidates, key=lambda p: len(p.parts))
 
 
+def is_submodule(parent: Path, rel: Path) -> bool:
+    """Return True if rel (relative to parent) is a registered git submodule."""
+    proc = run_git(parent, ["ls-files", "--stage", "--", str(rel)], check=False)
+    return proc.returncode == 0 and proc.stdout.strip().startswith("160000")
+
+
 def ensure_nested_repos_ignored(root: Path, repos: list[Path]) -> None:
     for repo in repos:
         if repo == root:
             continue
         parent = nearest_parent_repo(repos, repo)
         rel = repo.relative_to(parent)
+        if is_submodule(parent, rel):
+            continue
         proc = run_git(parent, ["check-ignore", "-q", str(rel)], check=False)
         if proc.returncode == 0:
             continue
