@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+unset VIRTUAL_ENV
+
 if ! command -v poetry >/dev/null 2>&1; then
   echo "ERROR: poetry is not installed. Install it first: https://python-poetry.org/docs/#installation" >&2
   exit 1

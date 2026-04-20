@@ -189,6 +189,11 @@ def current_branch(repo: Path) -> str:
     return branch
 
 
+def has_commits(repo: Path) -> bool:
+    proc = run_git(repo, ["rev-parse", "--verify", "--quiet", "HEAD"], check=False)
+    return proc.returncode == 0
+
+
 def filter_by_max_size(repo: Path, files: list[str], max_size: int) -> tuple[list[str], list[str]]:
     kept: list[str] = []
     ignored_large: list[str] = []
@@ -406,6 +411,14 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
 def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: list[str]) -> None:
     dirty_all = sorted(set(dirty_tracked + dirty_untracked))
     if not dirty_all:
+        return
+
+    if not has_commits(repo):
+        print(
+            f"[{repo}] Repository has no commits yet (unborn HEAD); skipping."
+            f" Create an initial commit before autocommit can back it up."
+            f" Examples:{format_examples(dirty_all)}"
+        )
         return
 
     marker = repo / ".autocommit.yaml"
