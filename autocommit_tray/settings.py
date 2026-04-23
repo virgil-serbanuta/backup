@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import os
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -8,6 +10,35 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import config as config_mod
 from . import scheduler_install
+
+
+def _lock_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR") or str(Path.home() / ".cache")
+    d = Path(base) / "autocommit-backup"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _lock_path() -> Path:
+    return _lock_dir() / "settings.lock"
+
+
+def _raise_flag_path() -> Path:
+    return _lock_dir() / "settings.raise"
+
+
+def _try_lock() -> int | None:
+    fd = os.open(str(_lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _raise_existing_window() -> None:
+    _raise_flag_path().touch()
 
 
 class SettingsWindow:
@@ -258,14 +289,46 @@ class _PrefixDialog:
             var.set(chosen)
 
 
+def _install_raise_watcher(root: tk.Tk) -> None:
+    flag = _raise_flag_path()
+
+    def check() -> None:
+        if flag.exists():
+            try:
+                flag.unlink()
+            except OSError:
+                pass
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(100, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        root.after(250, check)
+
+    root.after(250, check)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=Path, nargs="?", default=config_mod.DEFAULT_CONFIG_PATH)
     args = parser.parse_args(argv)
-    config_mod.ensure_exists(args.config)
-    root = tk.Tk()
-    SettingsWindow(root, args.config)
-    root.mainloop()
+
+    lock_fd = _try_lock()
+    if lock_fd is None:
+        _raise_existing_window()
+        return 0
+
+    try:
+        config_mod.ensure_exists(args.config)
+        root = tk.Tk()
+        SettingsWindow(root, args.config)
+        _install_raise_watcher(root)
+        root.mainloop()
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
     return 0
 
 
