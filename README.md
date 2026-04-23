@@ -82,6 +82,23 @@ Prerequisites:
 - [Poetry](https://python-poetry.org/docs/#installation).
 - `git`.
 - `libnotify-bin` (for `notify-send`, used by the daily failure notification).
+- **GI bindings for the AppIndicator backend.** `pystray`'s default Linux
+  backend (xorg) draws a legacy systray icon that GNOME/Ubuntu shells will
+  display but won't route clicks to — the icon appears but right-clicking
+  does nothing. `run_autocommit_tray.sh` forces the AppIndicator backend
+  via `PYSTRAY_BACKEND=appindicator`; for that to load, the Python venv
+  needs access to the system-wide GObject Introspection bindings:
+
+  ```sh
+  sudo apt install gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 python3-gi
+  # Let the Poetry venv see system site-packages (where python3-gi lives):
+  poetry config --local virtualenvs.options.system-site-packages true
+  poetry env remove --all && poetry install
+  ```
+
+  Other distros: install the equivalent packages (e.g. Fedora:
+  `libayatana-appindicator-gtk3` + `python3-gobject`; Arch:
+  `libayatana-appindicator` + `python-gobject`).
 - **GNOME users:** you need an AppIndicator / StatusNotifierItem extension
   — vanilla GNOME does not render tray icons. Ubuntu's GNOME ships
   `ubuntu-appindicators@ubuntu.com` enabled by default, so no extra step
@@ -123,6 +140,24 @@ Then, from the tray icon's menu, choose **Settings…** and:
    configured cadence. Inspect with `crontab -l`.
 4. Click **Enable tray autostart** — this writes a `.desktop` file to
    `~/.config/autostart/` so the tray starts on login.
+
+### Troubleshooting — tray icon appears but clicks do nothing
+
+This means pystray loaded its xorg backend instead of the AppIndicator
+one. Confirm by running from a terminal and looking at the traceback when
+you right-click the icon — if you see paths under
+`pystray/_xorg.py`, you're on the wrong backend. To check the
+appindicator backend is available in the venv:
+
+```sh
+PYSTRAY_BACKEND=appindicator ./run_autocommit_tray.sh
+```
+
+If that prints `ModuleNotFoundError: No module named 'gi'` or
+`Namespace AyatanaAppIndicator3 not available`, the GI bindings from the
+prerequisites section above aren't installed or aren't visible to the
+Poetry venv — follow the `apt install` + `virtualenvs.options.system-site-packages`
+steps.
 
 ## Setup — macOS
 
