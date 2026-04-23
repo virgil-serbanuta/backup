@@ -82,10 +82,22 @@ Prerequisites:
 - [Poetry](https://python-poetry.org/docs/#installation).
 - `git`.
 - `libnotify-bin` (for `notify-send`, used by the daily failure notification).
-- **GNOME users:** install and enable the
+- **GNOME users:** you need an AppIndicator / StatusNotifierItem extension
+  — vanilla GNOME does not render tray icons. Ubuntu's GNOME ships
+  `ubuntu-appindicators@ubuntu.com` enabled by default, so no extra step
+  is needed there. On other distros install and enable
   [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/)
-  extension — vanilla GNOME does not render tray icons. KDE, XFCE, Cinnamon,
+  (`appindicatorsupport@rgcjonas.gmail.com`), e.g. on Debian/Ubuntu:
+  `apt install gnome-shell-extension-appindicator`. KDE, XFCE, Cinnamon,
   and MATE work without extra extensions.
+
+  Check what's installed and enabled:
+
+  ```sh
+  gnome-extensions list --enabled | grep -i appindicator   # any enabled one?
+  gnome-extensions list | grep -i appindicator             # installed but maybe disabled
+  gnome-extensions enable <uuid>                           # turn on an installed one
+  ```
 
 Install and first run:
 
