@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# cron runs with a minimal PATH (/usr/bin:/bin) that omits ~/.local/bin,
+# where poetry typically lives — without this, the poetry check below fails
+# silently under cron (mail output is discarded when no MTA is installed).
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
 unset VIRTUAL_ENV
 
 if [[ $# -lt 1 ]]; then
