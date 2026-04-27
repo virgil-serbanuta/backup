@@ -9,6 +9,7 @@ venv/
 
 # Poetry
 poetry.lock
+.poetry-install-stamp
 
 # Editor/OS
 .DS_Store
