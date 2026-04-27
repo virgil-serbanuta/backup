@@ -340,9 +340,6 @@ def _commit_via_worktree(repo: Path, cfg: RepoConfig, files_to_commit: list[str]
         run_git(repo, ["worktree", "add", "--detach", str(wt_path), base_ref])
         worktree_added = True
         try:
-            run_git(wt_path, ["checkout", "-b", new_branch])
-            branch_created = True
-
             _populate_worktree(repo, wt_path, files_to_commit)
             run_git(wt_path, ["add", "-A", "--", *files_to_commit])
 
@@ -354,6 +351,9 @@ def _commit_via_worktree(repo: Path, cfg: RepoConfig, files_to_commit: list[str]
             if no_changes.returncode != 1:
                 stderr = no_changes.stderr.strip() or "unknown git error"
                 raise AutocommitError(f"git diff --cached --quiet failed: {stderr}", repo=repo)
+
+            run_git(wt_path, ["checkout", "-b", new_branch])
+            branch_created = True
 
             run_git(wt_path, ["commit", "-m", commit_message])
             print(f"[{repo}] Commit created on branch {new_branch}")

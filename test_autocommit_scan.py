@@ -554,13 +554,15 @@ class TestCommitNewBranch:
 
     def test_preserves_user_staged_files(self, tmp_path):
         repo = make_repo(tmp_path)
-        (repo / "user_staged.txt").write_text("staged by user\n")
-        _git(repo, "add", "user_staged.txt")
-        # Separately, an unstaged dirty file the backup will pick up.
+        # Pre-existing tracked file
         (repo / "dirty.txt").write_text("v1\n")
         _git(repo, "add", "dirty.txt")
-        _git(repo, "commit", "-m", "track dirty.txt")
+        _git(repo, "commit", "-m", "add dirty.txt")
+        # Modify dirty.txt (will be picked up by backup) and stage a new file
         (repo / "dirty.txt").write_text("v2\n")
+        (repo / "user_staged.txt").write_text("staged by user\n")
+        _git(repo, "add", "user_staged.txt")
+        assert "user_staged.txt" in staged_files(repo)
 
         commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["dirty.txt"])
 
