@@ -10,8 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
 from typing import cast
 
 import yaml
@@ -30,6 +30,7 @@ class RepoConfig:
     max_size: int
     max_files: int
     push: bool
+    auto_add: list[str] = field(default_factory=list[str])
 
 
 def run_git(repo: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -116,9 +117,45 @@ def ensure_nested_repos_ignored(root: Path, repos: list[Path]) -> None:
 
 
 def status_lines(repo: Path) -> list[str]:
-    proc = run_git(repo, ["status", "--porcelain", "--untracked-files=normal", "--ignored=no"])
-    lines = [line.rstrip("\n") for line in proc.stdout.splitlines() if line.strip()]
-    return lines
+    # -z: NUL-terminated entries with paths emitted as-is. Without -z, git
+    # wraps paths containing spaces or unusual characters in double quotes,
+    # which would break downstream pattern matching and `git add` pathspecs.
+    # --untracked-files=all so individual files inside new directories are
+    # visible — required for auto-add globs to match files at any depth.
+    proc = run_git(
+        repo,
+        ["status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no"],
+    )
+    raw = proc.stdout
+    if not raw:
+        return []
+    entries = raw.split("\0")
+    if entries and entries[-1] == "":
+        entries.pop()
+
+    result: list[str] = []
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        if len(entry) < 3:
+            i += 1
+            continue
+        # With -z, a rename/copy entry's source path is in the next token.
+        # We only care about the destination (already in `entry[3:]`), so
+        # consume and discard the source.
+        if entry[0] in ("R", "C"):
+            i += 2
+        else:
+            i += 1
+        result.append(entry)
+    return result
+
+
+def _matches_any_glob(rel_path: str, patterns: list[str]) -> bool:
+    if not patterns:
+        return False
+    p = PurePath(rel_path)
+    return any(p.match(pat) for pat in patterns)
 
 
 def tracked_changed_files(repo: Path, lines: list[str]) -> list[str]:
@@ -174,12 +211,29 @@ def load_repo_config(repo: Path) -> RepoConfig:
     if not isinstance(push, bool):
         raise AutocommitError("'push' must be a boolean", repo=repo)
 
+    auto_add_raw = content_map.get("auto-add")
+    auto_add: list[str]
+    if auto_add_raw is None:
+        auto_add = []
+    elif isinstance(auto_add_raw, str):
+        if not auto_add_raw:
+            raise AutocommitError("'auto-add' must be a non-empty string or list of non-empty strings", repo=repo)
+        auto_add = [auto_add_raw]
+    elif isinstance(auto_add_raw, list):
+        items = cast(list[object], auto_add_raw)
+        if not all(isinstance(p, str) and p for p in items):
+            raise AutocommitError("'auto-add' must be a non-empty string or list of non-empty strings", repo=repo)
+        auto_add = [cast(str, p) for p in items]
+    else:
+        raise AutocommitError("'auto-add' must be a non-empty string or list of non-empty strings", repo=repo)
+
     return RepoConfig(
         commit_type=commit_type,
         commit_branch=commit_branch,
         max_size=max_size,
         max_files=max_files,
         push=push,
+        auto_add=auto_add,
     )
 
 
@@ -406,15 +460,18 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
     cfg = load_repo_config(repo)
     warned = False
 
-    if cfg.commit_type == "changed" and dirty_untracked:
-        print(
-            f"[{repo}] commit type is 'changed' but repository has untracked files; they will not be committed."
-            f" Examples:{format_examples(sorted(dirty_untracked))}"
-        )
-        warned = True
-
-    candidates = dirty_tracked[:] if cfg.commit_type == "changed" else dirty_all[:]
-    candidates = sorted(set(candidates))
+    if cfg.commit_type == "changed":
+        auto_added = {f for f in dirty_untracked if _matches_any_glob(f, cfg.auto_add)}
+        unmatched_untracked = [f for f in dirty_untracked if f not in auto_added]
+        if unmatched_untracked:
+            print(
+                f"[{repo}] commit type is 'changed' but repository has untracked files; they will not be committed."
+                f" Examples:{format_examples(sorted(unmatched_untracked))}"
+            )
+            warned = True
+        candidates = sorted(set(dirty_tracked) | auto_added)
+    else:
+        candidates = sorted(set(dirty_all))
 
     candidates, ignored_large = filter_by_max_size(repo, candidates, cfg.max_size)
     if ignored_large:

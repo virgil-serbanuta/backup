@@ -6,3 +6,8 @@ commit branch: "#new"
 max-size: 10485760
 max-files: 200
 push: false
+# Optional: when commit type is "changed", also auto-include untracked
+# files whose path matches one of these globs. Accepts a single string
+# or a list. Patterns use pathlib.PurePath.match (right-to-left), so
+# '*.log' matches both 'foo.log' and 'subdir/foo.log'.
+# auto-add: "*.log"
