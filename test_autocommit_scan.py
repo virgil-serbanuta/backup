@@ -552,27 +552,40 @@ class TestCommitNewBranch:
         assert (repo / "file.txt").read_text() == "data\n"
         assert stash_count(repo) == 0
 
-    def test_restores_state_on_stash_apply_error(self, tmp_path, monkeypatch):
+    def test_preserves_user_staged_files(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "user_staged.txt").write_text("staged by user\n")
+        _git(repo, "add", "user_staged.txt")
+        # Separately, an unstaged dirty file the backup will pick up.
+        (repo / "dirty.txt").write_text("v1\n")
+        _git(repo, "add", "dirty.txt")
+        _git(repo, "commit", "-m", "track dirty.txt")
+        (repo / "dirty.txt").write_text("v2\n")
+
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["dirty.txt"])
+
+        # User's staged file remains staged in the main worktree.
+        assert "user_staged.txt" in staged_files(repo)
+        # User's other file kept its working-tree modification.
+        assert (repo / "dirty.txt").read_text() == "v2\n"
+        # Backup branch was created with the dirty file's content.
+        assert len(backup_branches(repo)) == 1
+        assert current_branch(repo) == "master"
+        assert stash_count(repo) == 0
+
+    def test_does_not_modify_main_worktree_files(self, tmp_path):
+        """Worktree approach: main repo's HEAD/index/working tree never change."""
         repo = make_repo(tmp_path)
         (repo / "file.txt").write_text("data\n")
+        head_before = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        status_before = _git(repo, "status", "--porcelain").stdout
 
-        # The #new flow applies the stash via `git checkout stash@{0} -- files`.
-        # Intercept that specific call (it has "--" in args but not "-b").
-        real = autocommit_scan.run_git
-        def failing(r, args, **kw):
-            if args[0] == "checkout" and "--" in args and "-b" not in args:
-                raise AutocommitError("injected checkout-stash failure", repo=r)
-            return real(r, args, **kw)
-        monkeypatch.setattr(autocommit_scan, "run_git", failing)
+        commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
 
-        with pytest.raises(AutocommitError, match="injected checkout-stash failure"):
-            commit_and_maybe_push(repo, make_cfg(commit_branch="#new"), ["file.txt"])
-
-        assert current_branch(repo) == "master"
-        assert backup_branches(repo) == []
-        assert staged_files(repo) == []
-        assert (repo / "file.txt").read_text() == "data\n"
-        assert stash_count(repo) == 0
+        head_after = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        status_after = _git(repo, "status", "--porcelain").stdout
+        assert head_before == head_after
+        assert status_before == status_after
 
 
 # ---------------------------------------------------------------------------
