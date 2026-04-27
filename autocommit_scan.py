@@ -408,10 +408,10 @@ def commit_and_maybe_push(repo: Path, cfg: RepoConfig, files_to_commit: list[str
             unstage_files(repo, files_to_commit)
 
 
-def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: list[str]) -> None:
+def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: list[str]) -> bool:
     dirty_all = sorted(set(dirty_tracked + dirty_untracked))
     if not dirty_all:
-        return
+        return False
 
     if not has_commits(repo):
         print(
@@ -419,7 +419,7 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
             f" Create an initial commit before autocommit can back it up."
             f" Examples:{format_examples(dirty_all)}"
         )
-        return
+        return True
 
     marker = repo / ".autocommit.yaml"
     if not marker.exists():
@@ -427,9 +427,18 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
             f"[{repo}] Dirty repository has no .autocommit.yaml marker; skipping."
             f" Examples:{format_examples(dirty_all)}"
         )
-        return
+        return True
 
     cfg = load_repo_config(repo)
+    warned = False
+
+    if cfg.commit_type == "changed" and dirty_untracked:
+        print(
+            f"[{repo}] commit type is 'changed' but repository has untracked files; they will not be committed."
+            f" Examples:{format_examples(sorted(dirty_untracked))}"
+        )
+        warned = True
+
     candidates = dirty_tracked[:] if cfg.commit_type == "changed" else dirty_all[:]
     candidates = sorted(set(candidates))
 
@@ -439,6 +448,7 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
             f"[{repo}] Ignored files larger than max-size={cfg.max_size}."
             f" Examples:{format_examples(sorted(ignored_large))}"
         )
+        warned = True
 
     to_commit, ignored_over_limit = cap_by_max_files(candidates, cfg.max_files)
     if ignored_over_limit:
@@ -446,8 +456,10 @@ def process_repository(repo: Path, dirty_tracked: list[str], dirty_untracked: li
             f"[{repo}] Ignored files beyond max-files={cfg.max_files}."
             f" Examples:{format_examples(sorted(ignored_over_limit))}"
         )
+        warned = True
 
     commit_and_maybe_push(repo, cfg, to_commit)
+    return warned
 
 
 def parse_args() -> argparse.Namespace:
@@ -472,14 +484,16 @@ def main() -> int:
 
         print(f"Found {len(repos)} repository/repositories under {root}")
 
+        warned = False
         for repo in repos:
             lines = status_lines(repo)
             tracked = tracked_changed_files(repo, lines)
             untracked = untracked_files(lines)
-            process_repository(repo, tracked, untracked)
+            if process_repository(repo, tracked, untracked):
+                warned = True
 
         print("Done")
-        return 0
+        return 1 if warned else 0
     except AutocommitError as exc:
         if exc.repo is not None:
             print(f"ERROR [{exc.repo}]: {exc}", file=sys.stderr)

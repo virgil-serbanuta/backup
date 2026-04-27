@@ -649,6 +649,51 @@ class TestProcessRepository:
         log = _git(repo, "log", "--oneline").stdout
         assert log.count("chore(backup)") == 1
 
+    def test_warns_on_untracked_with_commit_type_changed(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "new1.txt").write_text("a")
+        (repo / "new2.txt").write_text("b")
+
+        warned = process_repository(repo, [], ["new1.txt", "new2.txt"])
+
+        assert warned is True
+        out = capsys.readouterr().out
+        assert "commit type is 'changed'" in out
+        assert "new1.txt" in out
+        assert "new2.txt" in out
+
+    def test_no_warning_on_untracked_with_commit_type_all(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="all")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "new.txt").write_text("a")
+
+        warned = process_repository(repo, [], ["new.txt"])
+
+        assert warned is False
+        assert "commit type is 'changed'" not in capsys.readouterr().out
+
+    def test_returns_true_when_no_marker(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "file.txt").write_text("x")
+        assert process_repository(repo, [], ["file.txt"]) is True
+
+    def test_returns_false_on_clean_commit(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "data.txt").write_text("v1")
+        _git(repo, "add", "data.txt")
+        _git(repo, "commit", "-m", "add data")
+        (repo / "data.txt").write_text("v2")
+
+        assert process_repository(repo, ["data.txt"], []) is False
+
 
 # ---------------------------------------------------------------------------
 # main() — end-to-end via direct call (mocking sys.argv)
@@ -696,6 +741,25 @@ class TestMain:
         _child = make_repo(root / "child")
         monkeypatch.setattr(sys, "argv", ["prog", str(root)])
         assert autocommit_scan.main() == 1
+
+    def test_warning_flips_exit_code_but_run_completes(self, tmp_path, monkeypatch, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, commit_type="changed")
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "add config")
+        (repo / "tracked.txt").write_text("v1")
+        _git(repo, "add", "tracked.txt")
+        _git(repo, "commit", "-m", "add tracked")
+        (repo / "tracked.txt").write_text("v2")
+        (repo / "untracked.txt").write_text("new")
+
+        monkeypatch.setattr(sys, "argv", ["prog", str(repo)])
+        assert autocommit_scan.main() == 1
+        out = capsys.readouterr().out
+        assert "commit type is 'changed'" in out
+        assert "Done" in out  # script ran to completion
+        # Tracked change was still committed despite the warning
+        assert "chore(backup)" in _git(repo, "log", "--oneline").stdout
 
     def test_submodule_processed_without_gitignore(self, tmp_path, monkeypatch):
         root = make_repo(tmp_path / "root")
