@@ -68,14 +68,17 @@ def write_autocommit_yaml(
     max_size: int = 10 ** 9,
     max_files: int = 1000,
     push: bool = False,
+    auto_add: list[str] | str | None = None,
 ) -> None:
-    cfg = {
+    cfg: dict[str, object] = {
         "commit type": commit_type,
         "commit branch": commit_branch,
         "max-size": max_size,
         "max-files": max_files,
         "push": push,
     }
+    if auto_add is not None:
+        cfg["auto-add"] = auto_add
     (repo / ".autocommit.yaml").write_text(yaml.dump(cfg))
 
 
@@ -170,6 +173,27 @@ class TestCapByMaxFiles:
         kept, over = cap_by_max_files(["a", "b", "c"], 2)
         assert kept == ["a", "b"]
         assert over == ["c"]
+
+
+class TestStatusLines:
+    def test_paths_with_spaces_returned_unquoted(self, tmp_path):
+        repo = make_repo(tmp_path)
+        sub = repo / "Profile 2" / "Sessions"
+        sub.mkdir(parents=True)
+        (sub / "Session_42").write_text("x")
+        lines = autocommit_scan.status_lines(repo)
+        assert lines == ["?? Profile 2/Sessions/Session_42"]
+
+    def test_handles_renames(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / "old name.txt").write_text("x")
+        _git(repo, "add", "old name.txt")
+        _git(repo, "commit", "-m", "add")
+        _git(repo, "mv", "old name.txt", "new name.txt")
+        lines = autocommit_scan.status_lines(repo)
+        # Rename emitted as a single entry with the destination path
+        assert len(lines) == 1
+        assert lines[0].endswith("new name.txt")
 
 
 class TestStatusLineParsers:
@@ -356,6 +380,42 @@ class TestLoadRepoConfig:
             "max-size: 0\nmax-files: 0\npush: yes-please\n"
         )
         with pytest.raises(AutocommitError, match="push"):
+            load_repo_config(repo)
+
+    def test_auto_add_default_empty(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo)
+        assert load_repo_config(repo).auto_add == []
+
+    def test_auto_add_string_accepted(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, auto_add="*.log")
+        assert load_repo_config(repo).auto_add == ["*.log"]
+
+    def test_auto_add_list_accepted(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, auto_add=["*.log", "build/*.json"])
+        assert load_repo_config(repo).auto_add == ["*.log", "build/*.json"]
+
+    def test_auto_add_empty_string_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, auto_add="")
+        with pytest.raises(AutocommitError, match="auto-add"):
+            load_repo_config(repo)
+
+    def test_auto_add_empty_item_in_list_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(repo, auto_add=["*.log", ""])
+        with pytest.raises(AutocommitError, match="auto-add"):
+            load_repo_config(repo)
+
+    def test_auto_add_invalid_type_raises(self, tmp_path):
+        repo = make_repo(tmp_path)
+        (repo / ".autocommit.yaml").write_text(
+            "commit type: changed\ncommit branch: master\n"
+            "max-size: 0\nmax-files: 0\npush: false\nauto-add: 42\n"
+        )
+        with pytest.raises(AutocommitError, match="auto-add"):
             load_repo_config(repo)
 
 
@@ -708,6 +768,89 @@ class TestProcessRepository:
         (repo / "data.txt").write_text("v2")
 
         assert process_repository(repo, ["data.txt"], []) is False
+
+    def test_auto_add_includes_matching_untracked(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(
+            repo, commit_type="changed", commit_branch="#new", auto_add="*.log"
+        )
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "config")
+        (repo / "app.log").write_text("entry\n")
+
+        warned = process_repository(repo, [], ["app.log"])
+
+        assert warned is False
+        branches = backup_branches(repo)
+        assert len(branches) == 1
+        files = _git(repo, "ls-tree", "-r", "--name-only", branches[0]).stdout.splitlines()
+        assert "app.log" in files
+
+    def test_auto_add_skips_non_matching_and_warns(self, tmp_path, capsys):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(
+            repo, commit_type="changed", commit_branch="#new", auto_add="*.log"
+        )
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "config")
+        (repo / "app.log").write_text("entry\n")
+        (repo / "data.json").write_text("data\n")
+
+        warned = process_repository(repo, [], ["app.log", "data.json"])
+
+        assert warned is True
+        out = capsys.readouterr().out
+        assert "data.json" in out
+        # The matched file should not appear in the "will not be committed" warning
+        warning_block = out.split("will not be committed", 1)[1]
+        assert "app.log" not in warning_block
+        branches = backup_branches(repo)
+        files = _git(repo, "ls-tree", "-r", "--name-only", branches[0]).stdout.splitlines()
+        assert "app.log" in files
+        assert "data.json" not in files
+
+    def test_auto_add_matches_nested_paths(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(
+            repo, commit_type="changed", commit_branch="#new", auto_add="*.log"
+        )
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "config")
+        (repo / "logs").mkdir()
+        (repo / "logs" / "app.log").write_text("entry\n")
+
+        warned = process_repository(repo, [], ["logs/app.log"])
+
+        assert warned is False
+        branches = backup_branches(repo)
+        files = _git(repo, "ls-tree", "-r", "--name-only", branches[0]).stdout.splitlines()
+        assert "logs/app.log" in files
+
+    def test_auto_add_list_of_patterns(self, tmp_path):
+        repo = make_repo(tmp_path)
+        write_autocommit_yaml(
+            repo,
+            commit_type="changed",
+            commit_branch="#new",
+            auto_add=["*.log", "build/*.json"],
+        )
+        _git(repo, "add", ".autocommit.yaml")
+        _git(repo, "commit", "-m", "config")
+        (repo / "app.log").write_text("entry\n")
+        (repo / "build").mkdir()
+        (repo / "build" / "out.json").write_text("{}\n")
+        (repo / "other.txt").write_text("nope\n")
+
+        warned = process_repository(
+            repo, [], ["app.log", "build/out.json", "other.txt"]
+        )
+
+        assert warned is True  # other.txt warns
+        branches = backup_branches(repo)
+        files = _git(repo, "ls-tree", "-r", "--name-only", branches[0]).stdout.splitlines()
+        assert "app.log" in files
+        assert "build/out.json" in files
+        assert "other.txt" not in files
 
 
 # ---------------------------------------------------------------------------
