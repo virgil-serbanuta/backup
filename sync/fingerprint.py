@@ -24,8 +24,9 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 FINGERPRINT_FILENAME = ".fingerprint"
 TMP_SUFFIX = ".tmp"
@@ -49,12 +50,90 @@ def empty_fingerprint() -> Fingerprint:
     return {"files": {}, "dirs": {}}
 
 
-def md5_of_file(path: Path) -> str:
+def md5_of_file(path: Path, on_chunk: Optional[Callable[[int], None]] = None) -> str:
     h = hashlib.md5()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
             h.update(chunk)
+            if on_chunk is not None:
+                on_chunk(len(chunk))
     return h.hexdigest()
+
+
+def _fmt_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PiB"
+
+
+def _ellipsize_left(s: str, max_len: int) -> str:
+    if max_len <= 3 or len(s) <= max_len:
+        return s
+    return "..." + s[-(max_len - 3):]
+
+
+class _NullReporter:
+    def note_directory(self, path: Path) -> None: ...
+    def note_bytes(self, n: int) -> None: ...
+    def note_file(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class HeartbeatReporter:
+    """In-place stderr progress line, refreshed at most every INTERVAL seconds.
+
+    Updates are driven from two callsites: note_directory() when entering a
+    new directory, and note_bytes() from inside md5_of_file's chunk loop so a
+    single huge file still produces liveness output mid-hash.
+    """
+
+    INTERVAL = 1.0
+
+    def __init__(self, stream=sys.stderr) -> None:
+        self.stream = stream
+        self._files = 0
+        self._bytes = 0
+        self._current_dir: Optional[Path] = None
+        self._last_emit = time.monotonic()  # avoids a tick on the very first call
+        self._emitted_anything = False
+
+    def note_directory(self, path: Path) -> None:
+        self._current_dir = path
+        self._maybe_emit()
+
+    def note_bytes(self, n: int) -> None:
+        self._bytes += n
+        self._maybe_emit()
+
+    def note_file(self) -> None:
+        self._files += 1
+
+    def _maybe_emit(self) -> None:
+        now = time.monotonic()
+        if now - self._last_emit < self.INTERVAL:
+            return
+        self._last_emit = now
+        try:
+            cols = os.get_terminal_size(self.stream.fileno()).columns
+        except (OSError, ValueError):
+            cols = 80
+        head = f"  hashing: {self._files:,} files, {_fmt_bytes(self._bytes)}"
+        if self._current_dir is not None:
+            tail = "  " + _ellipsize_left(str(self._current_dir), max(10, cols - len(head) - 2))
+        else:
+            tail = ""
+        msg = (head + tail).ljust(cols - 1)[: cols - 1]
+        self.stream.write("\r" + msg)
+        self.stream.flush()
+        self._emitted_anything = True
+
+    def close(self) -> None:
+        if self._emitted_anything:
+            self.stream.write("\n")
+            self.stream.flush()
 
 
 def load_fingerprint(path: Path) -> Fingerprint:
@@ -92,9 +171,17 @@ def _valid_entry(value: object) -> bool:
 
 
 def process_directory(
-    directory: Path, full_recompute: bool, prune: bool, verbose: bool
+    directory: Path,
+    full_recompute: bool,
+    prune: bool,
+    verbose: bool,
+    reporter: Optional[object] = None,
 ) -> None:
     """Depth-first: write children's .fingerprint first, then this dir's."""
+
+    if reporter is None:
+        reporter = _NullReporter()
+    reporter.note_directory(directory)
 
     fingerprint_path = directory / FINGERPRINT_FILENAME
     # Always load existing entries: even in --full mode they hold the md5/size
@@ -132,10 +219,14 @@ def process_directory(
     new_dirs: Dict[str, Entry] = {}
     for entry in dir_entries:
         sub_path = Path(entry.path)
-        process_directory(sub_path, full_recompute, prune, verbose)
+        process_directory(sub_path, full_recompute, prune, verbose, reporter)
+        # Re-assert the current directory after the recursion bubbles back.
+        reporter.note_directory(directory)
         sub_fp = sub_path / FINGERPRINT_FILENAME
         try:
-            md5, size = md5_and_size(sub_fp)
+            size = sub_fp.stat().st_size
+            md5 = md5_of_file(sub_fp, on_chunk=reporter.note_bytes)
+            reporter.note_file()
             new_dirs[entry.name] = {"md5": md5, "size": size}
         except (FileNotFoundError, PermissionError) as exc:
             print(f"warning: cannot read {sub_fp}: {exc}", file=sys.stderr)
@@ -154,10 +245,11 @@ def process_directory(
             md5 = prior["md5"]
         else:
             try:
-                md5 = md5_of_file(Path(entry.path))
+                md5 = md5_of_file(Path(entry.path), on_chunk=reporter.note_bytes)
             except (PermissionError, FileNotFoundError, OSError) as exc:
                 print(f"warning: cannot hash {entry.path}: {exc}", file=sys.stderr)
                 continue
+            reporter.note_file()
         new_files[name] = {"md5": md5, "size": size}
 
     preserved = 0
@@ -224,9 +316,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {root} is not a directory", file=sys.stderr)
         return 1
 
-    process_directory(
-        root, full_recompute=args.full, prune=args.prune, verbose=args.verbose
-    )
+    # Show a live heartbeat on an interactive terminal. Suppressed under -v
+    # (which already prints per-directory lines, and would visually fight
+    # with the in-place \r line).
+    reporter: object
+    if not args.verbose and sys.stderr.isatty():
+        reporter = HeartbeatReporter()
+    else:
+        reporter = _NullReporter()
+
+    try:
+        process_directory(
+            root,
+            full_recompute=args.full,
+            prune=args.prune,
+            verbose=args.verbose,
+            reporter=reporter,
+        )
+    finally:
+        reporter.close()
     return 0
 
 
