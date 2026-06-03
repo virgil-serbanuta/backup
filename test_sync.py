@@ -589,3 +589,101 @@ class TestPerDirectoryRefresh:
         assert (remote / "a" / "x.txt").read_bytes() == b"x"
         assert not (remote / FP).exists()
         assert not (remote / "a" / FP).exists()
+
+
+@needs_ssh
+@needs_remote_python
+class TestRefreshOnlyOnChange:
+    """A directory's fingerprint is refreshed only on the side that actually
+    changed: pushes dirty the remote, pulls dirty the local, and an unchanged
+    directory refreshes neither."""
+
+    @staticmethod
+    def _spy_remote(monkeypatch):
+        calls: list[str] = []
+        real = sync_tool.RemoteFingerprinter.refresh_one
+
+        def spy(self, remote_dir):
+            calls.append(remote_dir)
+            return real(self, remote_dir)
+
+        monkeypatch.setattr(sync_tool.RemoteFingerprinter, "refresh_one", spy)
+        return calls
+
+    @staticmethod
+    def _spy_local(monkeypatch):
+        calls: list[str] = []
+        real = sync_tool.refresh_local_directory
+
+        def spy(local_dir, verbose):
+            calls.append(str(local_dir))
+            return real(local_dir, verbose)
+
+        monkeypatch.setattr(sync_tool, "refresh_local_directory", spy)
+        return calls
+
+    def test_pull_only_directory_does_not_refresh_remote(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(remote, {"r.txt": b"r"})
+        fingerprint_tree(remote)
+        local.mkdir()
+        remote_calls = self._spy_remote(monkeypatch)
+
+        _run_sync(local, remote)
+
+        # Nothing was pushed, so the remote is untouched and must not refresh.
+        assert remote_calls == []
+        # The pulled file did land and the local fingerprint reflects it.
+        assert "r.txt" in read_fp(local)["files"]
+
+    def test_push_only_directory_does_not_refresh_local(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"a.txt": b"a"})
+        fingerprint_tree(local)
+        local_calls = self._spy_local(monkeypatch)
+
+        _run_sync(local, remote)
+
+        # Nothing was pulled, so the local tree is untouched and must not refresh.
+        assert local_calls == []
+        # The pushed file produced a remote fingerprint.
+        assert "a.txt" in read_fp(remote)["files"]
+
+    def test_remote_change_propagates_to_ancestor_directories(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"a": {"b": {"y.txt": b"y"}}})
+        fingerprint_tree(local)
+        remote_calls = self._spy_remote(monkeypatch)
+
+        _run_sync(local, remote)
+
+        # The push happens in a/b; every ancestor's dir pointer changed, so each
+        # must be refreshed on the remote.
+        assert str(remote / "a" / "b") in remote_calls
+        assert str(remote / "a") in remote_calls
+        assert str(remote) in remote_calls
+
+    def test_unchanged_second_run_refreshes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"a.txt": b"a", "sub": {"b.txt": b"b"}})
+        fingerprint_tree(local)
+        _run_sync(local, remote)  # first run populates both sides
+
+        remote_calls = self._spy_remote(monkeypatch)
+        local_calls = self._spy_local(monkeypatch)
+        _run_sync(local, remote)  # second run: nothing to do
+
+        assert remote_calls == []
+        assert local_calls == []

@@ -183,12 +183,13 @@ def ensure_remote_dir(conn: SSHConn, remote_dir: str) -> None:
 
 def push_file(
     conn: SSHConn, local_file: Path, remote_dir: str, name: str, verbose: bool
-) -> None:
+) -> bool:
+    """Push one file local -> remote. Returns True iff the remote changed."""
     if not local_file.is_file():
         # Fingerprint listed it but the file is gone — not an error.
         if verbose:
             print(f"skip push (missing locally): {local_file}", file=sys.stderr)
-        return
+        return False
     remote_tmp = posixpath.join(remote_dir, name + SYNC_SUFFIX)
     remote_final = posixpath.join(remote_dir, name)
     try:
@@ -199,7 +200,7 @@ def push_file(
             file=sys.stderr,
         )
         conn.run(f"rm -f -- {shlex.quote(remote_tmp)}", check=False)
-        return
+        return False
     try:
         conn.run(f"mv -- {shlex.quote(remote_tmp)} {shlex.quote(remote_final)}")
     except subprocess.CalledProcessError as exc:
@@ -209,14 +210,16 @@ def push_file(
             file=sys.stderr,
         )
         conn.run(f"rm -f -- {shlex.quote(remote_tmp)}", check=False)
-        return
+        return False
     if verbose:
         print(f"push: {local_file} -> {conn.host}:{remote_final}", file=sys.stderr)
+    return True
 
 
 def pull_file(
     conn: SSHConn, remote_dir: str, name: str, local_dir: Path, verbose: bool
-) -> None:
+) -> bool:
+    """Pull one file remote -> local. Returns True iff the local tree changed."""
     local_tmp = local_dir / (name + SYNC_SUFFIX)
     local_final = local_dir / name
     remote_path = posixpath.join(remote_dir, name)
@@ -238,7 +241,7 @@ def pull_file(
                 local_tmp.unlink()
             except OSError:
                 pass
-        return
+        return False
     try:
         os.replace(local_tmp, local_final)
     except OSError as exc:
@@ -248,9 +251,10 @@ def pull_file(
                 local_tmp.unlink()
             except OSError:
                 pass
-        return
+        return False
     if verbose:
         print(f"pull: {conn.host}:{remote_path} -> {local_final}", file=sys.stderr)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +274,19 @@ def sync_directory(
     remote_dir: str,
     verbose: bool,
     refresher: Optional[RemoteFingerprinter] = None,
-) -> None:
+) -> tuple[bool, bool]:
     """Sync one directory and recurse.
 
-    When refresher is given, each directory's .fingerprint is refreshed on both
-    sides as soon as that directory (and its children) finish, so an interrupted
-    run still leaves every completed directory current. When it is None no
-    fingerprints are written (the --no-refresh-after path).
+    Returns (local_changed, remote_changed) for this directory's whole subtree:
+    pulls dirty the local side, pushes dirty the remote side, and a changed
+    child dirties both ancestors' dir pointers on the side that changed.
+
+    When refresher is given, each directory's .fingerprint is refreshed as soon
+    as that directory (and its children) finish — but only on the side that
+    actually changed, so a pull-only or unchanged directory costs no refresh.
+    Bottom-up + per-directory means an interrupted run still leaves every
+    finished directory current. When refresher is None no fingerprints are
+    written (the --no-refresh-after path).
     """
     local_fp = load_local_fingerprint(local_dir)
     remote_fp = load_remote_fingerprint(conn, remote_dir)
@@ -286,15 +296,20 @@ def sync_directory(
     local_dirs = local_fp.get("dirs", {})
     remote_dirs = remote_fp.get("dirs", {})
 
+    local_changed = False
+    remote_changed = False
+
     for name in sorted(local_files):
         if name in remote_files:
             continue
-        push_file(conn, local_dir / name, remote_dir, name, verbose)
+        if push_file(conn, local_dir / name, remote_dir, name, verbose):
+            remote_changed = True
 
     for name in sorted(remote_files):
         if name in local_files:
             continue
-        pull_file(conn, remote_dir, name, local_dir, verbose)
+        if pull_file(conn, remote_dir, name, local_dir, verbose):
+            local_changed = True
 
     for name in sorted(set(local_dirs) | set(remote_dirs)):
         if name in local_files or name in remote_files:
@@ -330,15 +345,24 @@ def sync_directory(
                 file=sys.stderr,
             )
             continue
-        sync_directory(conn, sub_local, sub_remote, verbose, refresher)
+        sub_local_changed, sub_remote_changed = sync_directory(
+            conn, sub_local, sub_remote, verbose, refresher
+        )
+        local_changed = local_changed or sub_local_changed
+        remote_changed = remote_changed or sub_remote_changed
 
-    # Children are now current (recursed above, or identical-skipped) and any
-    # files pulled into this directory sit on disk, so record this directory's
-    # new state on both sides. Bottom-up + per-directory means an interrupted
-    # run still leaves every finished directory's fingerprint usable next run.
+    # Record this directory's new state, but only on the side that actually
+    # changed: a changed child (or a pull/push here) dirties that side's dir
+    # pointer, so refreshing it keeps the fingerprint current; an untouched side
+    # is already current and needs no work. Refreshing bottom-up + per-directory
+    # leaves every finished directory usable even if the run is interrupted.
     if refresher is not None:
-        refresh_local_directory(local_dir, verbose)
-        refresher.refresh_one(remote_dir)
+        if local_changed:
+            refresh_local_directory(local_dir, verbose)
+        if remote_changed:
+            refresher.refresh_one(remote_dir)
+
+    return local_changed, remote_changed
 
 
 # ---------------------------------------------------------------------------
