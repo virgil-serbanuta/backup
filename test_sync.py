@@ -524,3 +524,68 @@ class TestPostSyncRefresh:
         # The post-sync refresh rewrites the .fingerprint file in place but
         # with identical content, so byte equality should still hold.
         assert (remote / FP).read_bytes() == remote_fp_before
+
+
+@needs_ssh
+@needs_remote_python
+class TestPerDirectoryRefresh:
+    """By default each directory's .fingerprint is refreshed on BOTH sides as
+    soon as that directory is finished, not only at the very end of the run."""
+
+    def test_completed_subdir_is_fingerprinted_when_a_later_subdir_crashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        # Subdirs are processed in sorted order, so 'aaa' completes before
+        # 'zzz'. We blow up while transferring 'zzz' to simulate a mid-run crash.
+        make_tree(local, {"aaa": {"x.txt": b"x"}, "zzz": {"y.txt": b"y"}})
+        fingerprint_tree(local)
+
+        real_push = sync_tool.push_file
+
+        def exploding_push(conn, local_file, remote_dir, name, verbose):
+            if "zzz" in str(local_file):
+                raise RuntimeError("simulated crash mid-run")
+            return real_push(conn, local_file, remote_dir, name, verbose)
+
+        monkeypatch.setattr(sync_tool, "push_file", exploding_push)
+
+        with pytest.raises(RuntimeError):
+            _run_sync(local, remote)
+
+        # 'aaa' finished before the crash, so its fingerprint must already be
+        # current on BOTH sides even though the overall run aborted.
+        assert "x.txt" in read_fp(local / "aaa")["files"]
+        assert "x.txt" in read_fp(remote / "aaa")["files"]
+
+    def test_nested_dirs_are_fingerprinted_on_both_sides_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"top.txt": b"t", "a": {"x.txt": b"x", "b": {"y.txt": b"y"}}})
+        fingerprint_tree(local)
+
+        _run_sync(local, remote)  # default: per-directory refresh
+
+        for side in (local, remote):
+            assert (side / FP).exists()
+            assert (side / "a" / FP).exists()
+            assert (side / "a" / "b" / FP).exists()
+            assert "y.txt" in read_fp(side / "a" / "b")["files"]
+
+    def test_no_refresh_after_skips_per_directory_refresh(
+        self, tmp_path: Path
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"a": {"x.txt": b"x"}})
+        fingerprint_tree(local)
+
+        _run_sync(local, remote, "--no-refresh-after")
+
+        # Files transferred, but no fingerprint written on the remote side.
+        assert (remote / "a" / "x.txt").read_bytes() == b"x"
+        assert not (remote / FP).exists()
+        assert not (remote / "a" / FP).exists()

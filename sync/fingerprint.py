@@ -176,8 +176,16 @@ def process_directory(
     prune: bool,
     verbose: bool,
     reporter: Optional[object] = None,
+    recurse: bool = True,
 ) -> None:
-    """Depth-first: write children's .fingerprint first, then this dir's."""
+    """Depth-first: write children's .fingerprint first, then this dir's.
+
+    With recurse=False only this one directory is (re)written; children are not
+    descended into. Their existing .fingerprint files are still read to build
+    this directory's `dirs` pointers, so callers that refresh bottom-up (each
+    directory after its children are already current) get a correct parent
+    without re-walking the whole subtree.
+    """
 
     if reporter is None:
         reporter = _NullReporter()
@@ -219,9 +227,10 @@ def process_directory(
     new_dirs: Dict[str, Entry] = {}
     for entry in dir_entries:
         sub_path = Path(entry.path)
-        process_directory(sub_path, full_recompute, prune, verbose, reporter)
-        # Re-assert the current directory after the recursion bubbles back.
-        reporter.note_directory(directory)
+        if recurse:
+            process_directory(sub_path, full_recompute, prune, verbose, reporter)
+            # Re-assert the current directory after the recursion bubbles back.
+            reporter.note_directory(directory)
         sub_fp = sub_path / FINGERPRINT_FILENAME
         try:
             size = sub_fp.stat().st_size
@@ -229,7 +238,13 @@ def process_directory(
             reporter.note_file()
             new_dirs[entry.name] = {"md5": md5, "size": size}
         except (FileNotFoundError, PermissionError) as exc:
-            print(f"warning: cannot read {sub_fp}: {exc}", file=sys.stderr)
+            prior = existing["dirs"].get(entry.name)
+            if not recurse and _valid_entry(prior):
+                # Non-recursive refresh of a child that has no .fingerprint yet:
+                # keep its previous pointer rather than dropping the subtree.
+                new_dirs[entry.name] = prior
+            else:
+                print(f"warning: cannot read {sub_fp}: {exc}", file=sys.stderr)
 
     new_files: Dict[str, Entry] = {}
     for entry in file_entries:
@@ -307,6 +322,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--no-recurse",
+        dest="recurse",
+        action="store_false",
+        help=(
+            "Fingerprint only ROOT itself, not its subtree. Children's existing "
+            ".fingerprint files are still read to build ROOT's dir pointers."
+        ),
+    )
+    parser.set_defaults(recurse=True)
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Log each directory as it is written."
     )
     args = parser.parse_args(argv)
@@ -332,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             prune=args.prune,
             verbose=args.verbose,
             reporter=reporter,
+            recurse=args.recurse,
         )
     finally:
         reporter.close()

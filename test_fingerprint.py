@@ -499,3 +499,74 @@ def test_filenames_with_spaces_and_unicode(tmp_path: Path) -> None:
     run(tmp_path)
     files = read_fp(tmp_path)["files"]
     assert {"name with spaces.txt", "café", "snowman ☃.txt"} <= set(files)
+
+
+# ---------------------------------------------------------------------------
+# Non-recursive mode (recurse=False / --no-recurse)
+# ---------------------------------------------------------------------------
+
+
+def test_recurse_false_does_not_descend_into_children(tmp_path: Path) -> None:
+    """recurse=False fingerprints only the target directory; a child's own
+    .fingerprint is left exactly as it was, even if the child changed."""
+    make_tree(tmp_path, {"child": {"x.txt": b"x"}})
+    fingerprint.process_directory(
+        tmp_path / "child", full_recompute=True, prune=False, verbose=False
+    )
+    stale = (tmp_path / "child" / FP).read_bytes()
+    # Mutate the child but do NOT refingerprint it.
+    (tmp_path / "child" / "y.txt").write_bytes(b"y")
+
+    fingerprint.process_directory(
+        tmp_path, full_recompute=True, prune=False, verbose=False, recurse=False
+    )
+
+    # Child fingerprint untouched because we never recursed into it.
+    assert (tmp_path / "child" / FP).read_bytes() == stale
+    assert "y.txt" not in read_fp(tmp_path / "child")["files"]
+
+
+def test_recurse_false_records_existing_child_pointer(tmp_path: Path) -> None:
+    make_tree(tmp_path, {"top.txt": b"top", "child": {"x.txt": b"x"}})
+    fingerprint.process_directory(
+        tmp_path / "child", full_recompute=True, prune=False, verbose=False
+    )
+
+    fingerprint.process_directory(
+        tmp_path, full_recompute=True, prune=False, verbose=False, recurse=False
+    )
+
+    root = read_fp(tmp_path)
+    assert "top.txt" in root["files"]
+    child_fp = tmp_path / "child" / FP
+    assert root["dirs"]["child"] == {
+        "md5": md5(child_fp.read_bytes()),
+        "size": child_fp.stat().st_size,
+    }
+
+
+def test_recurse_false_preserves_prior_dir_pointer_when_child_fp_missing(
+    tmp_path: Path,
+) -> None:
+    make_tree(tmp_path, {"child": {"x.txt": b"x"}})
+    fingerprint.process_directory(
+        tmp_path, full_recompute=True, prune=False, verbose=False
+    )
+    prior = read_fp(tmp_path)["dirs"]["child"]
+    (tmp_path / "child" / FP).unlink()
+
+    fingerprint.process_directory(
+        tmp_path, full_recompute=True, prune=False, verbose=False, recurse=False
+    )
+
+    # Prior pointer preserved rather than dropped, and we did not recreate the
+    # child's fingerprint (no recursion).
+    assert read_fp(tmp_path)["dirs"]["child"] == prior
+    assert not (tmp_path / "child" / FP).exists()
+
+
+def test_no_recurse_cli_flag_writes_only_target(tmp_path: Path) -> None:
+    make_tree(tmp_path, {"child": {"x.txt": b"x"}})
+    assert run(tmp_path, "--no-recurse") == 0
+    assert (tmp_path / FP).exists()
+    assert not (tmp_path / "child" / FP).exists()
