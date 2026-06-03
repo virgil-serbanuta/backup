@@ -9,6 +9,10 @@ is bidirectional and conservative:
     local -> remote.
   - Files in the remote .fingerprint but absent from the local one are pulled
     remote -> local.
+  - A local-only file and a remote-only file in the same directory with
+    identical content (md5 + size) that is unique there look like a rename:
+    they are reported and left in place, not copied to both sides. (For now
+    detection only logs the pair; it performs no rename.)
   - Files whose name appears in BOTH fingerprints are left untouched, even if
     their md5/size differ. No file is ever overwritten.
   - A fingerprint entry whose backing file is missing on disk is silently
@@ -41,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -268,6 +273,44 @@ def _dir_entries_match(a: Optional[dict], b: Optional[dict]) -> bool:
     return a.get("md5") == b.get("md5") and a.get("size") == b.get("size")
 
 
+def _content_key(entry: dict) -> tuple:
+    return (entry.get("md5"), entry.get("size"))
+
+
+def detect_renames(
+    local_files: dict, remote_files: dict
+) -> list[tuple[str, str]]:
+    """Find (local_name, remote_name) pairs that look like a rename.
+
+    A pair qualifies when the local file is absent remotely, the remote file is
+    absent locally, the two share identical content (md5 + size), and that
+    content is unique within the directory on both sides (no other file — on
+    either side — has it). Returned sorted by local name.
+    """
+    local_counts = Counter(_content_key(e) for e in local_files.values())
+    remote_counts = Counter(_content_key(e) for e in remote_files.values())
+    remote_only_by_content = {
+        _content_key(e): n
+        for n, e in remote_files.items()
+        if n not in local_files
+    }
+
+    renames: list[tuple[str, str]] = []
+    for lname in sorted(local_files):
+        if lname in remote_files:
+            continue
+        key = _content_key(local_files[lname])
+        # Content must appear exactly once on each side for the match to be
+        # unambiguous; that single remote file is then necessarily remote-only.
+        if local_counts[key] != 1 or remote_counts[key] != 1:
+            continue
+        rname = remote_only_by_content.get(key)
+        if rname is None:
+            continue
+        renames.append((lname, rname))
+    return renames
+
+
 def sync_directory(
     conn: SSHConn,
     local_dir: Path,
@@ -299,14 +342,28 @@ def sync_directory(
     local_changed = False
     remote_changed = False
 
+    # A file that was merely renamed appears as local-only on one side and
+    # remote-only on the other with identical content. Detect those pairs and
+    # leave them in place (for now we only report them) instead of copying the
+    # content to both sides under both names.
+    renamed_local: set[str] = set()
+    renamed_remote: set[str] = set()
+    for lname, rname in detect_renames(local_files, remote_files):
+        renamed_local.add(lname)
+        renamed_remote.add(rname)
+        print(
+            f"rename: {local_dir / lname} <-> {posixpath.join(remote_dir, rname)}",
+            file=sys.stderr,
+        )
+
     for name in sorted(local_files):
-        if name in remote_files:
+        if name in remote_files or name in renamed_local:
             continue
         if push_file(conn, local_dir / name, remote_dir, name, verbose):
             remote_changed = True
 
     for name in sorted(remote_files):
-        if name in local_files:
+        if name in local_files or name in renamed_remote:
             continue
         if pull_file(conn, remote_dir, name, local_dir, verbose):
             local_changed = True

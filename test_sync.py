@@ -687,3 +687,110 @@ class TestRefreshOnlyOnChange:
 
         assert remote_calls == []
         assert local_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Rename detection (pure logic, no SSH)
+# ---------------------------------------------------------------------------
+
+
+def _files(**kw: bytes) -> dict:
+    """Build a fingerprint 'files' dict from name=content bytes."""
+    return {n: {"md5": md5(c), "size": len(c)} for n, c in kw.items()}
+
+
+def test_detect_renames_simple_pair() -> None:
+    local = _files(new_name=b"unique-content")
+    remote = _files(old_name=b"unique-content")
+    assert sync_tool.detect_renames(local, remote) == [("new_name", "old_name")]
+
+
+def test_detect_renames_none_when_content_differs() -> None:
+    local = _files(f=b"AAA")
+    remote = _files(g=b"BBB")
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+def test_detect_renames_none_when_names_match() -> None:
+    local = _files(a=b"same")
+    remote = _files(a=b"same")
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+def test_detect_renames_skips_ambiguous_duplicate_local() -> None:
+    # Two local files share the content, so a single remote match is ambiguous.
+    local = _files(f=b"dup", h=b"dup")
+    remote = _files(g=b"dup")
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+def test_detect_renames_skips_when_content_also_in_a_common_file() -> None:
+    # 'shared' exists on both sides with the same content as the candidate, so
+    # the content is not unique in the directory.
+    local = _files(f=b"C", shared=b"C")
+    remote = _files(g=b"C", shared=b"C")
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+def test_detect_renames_skips_ambiguous_duplicate_remote() -> None:
+    local = _files(f=b"dup")
+    remote = _files(g1=b"dup", g2=b"dup")
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+def test_detect_renames_multiple_independent_pairs() -> None:
+    local = _files(f1=b"C1", f2=b"C2")
+    remote = _files(g1=b"C1", g2=b"C2")
+    assert sorted(sync_tool.detect_renames(local, remote)) == [
+        ("f1", "g1"),
+        ("f2", "g2"),
+    ]
+
+
+def test_detect_renames_same_content_different_size_is_not_a_match() -> None:
+    # Construct equal md5 illusion is impossible here, but guard the size field:
+    local = {"f": {"md5": "abc", "size": 10}}
+    remote = {"g": {"md5": "abc", "size": 11}}
+    assert sync_tool.detect_renames(local, remote) == []
+
+
+@needs_ssh
+class TestRenameDetection:
+    """A renamed file (same content, different name on each side) is listed and
+    left in place rather than copied to both sides."""
+
+    def test_rename_is_listed_and_not_transferred(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"new-name.txt": b"unique-content"})
+        make_tree(remote, {"old-name.txt": b"unique-content"})
+        fingerprint_tree(local)
+        fingerprint_tree(remote)
+
+        _run_sync(local, remote, "--no-refresh-after")
+
+        # Neither side gains a duplicate under the other's name.
+        assert not (remote / "new-name.txt").exists()
+        assert not (local / "old-name.txt").exists()
+        err = capsys.readouterr().err
+        assert "rename" in err
+        assert "new-name.txt" in err and "old-name.txt" in err
+
+    def test_ambiguous_duplicate_content_still_syncs_normally(
+        self, tmp_path: Path
+    ) -> None:
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"a.txt": b"dup", "b.txt": b"dup"})
+        make_tree(remote, {"c.txt": b"dup"})
+        fingerprint_tree(local)
+        fingerprint_tree(remote)
+
+        _run_sync(local, remote, "--no-refresh-after")
+
+        # Not a clean rename, so the normal union policy applies.
+        assert (remote / "a.txt").read_bytes() == b"dup"
+        assert (remote / "b.txt").read_bytes() == b"dup"
+        assert (local / "c.txt").read_bytes() == b"dup"
