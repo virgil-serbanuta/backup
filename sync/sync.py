@@ -24,9 +24,10 @@ sidecars.
 Optional pre-sync step: --refresh runs the fingerprint tool (incremental) on
 the local tree so any local changes are visible to the comparison.
 
-Post-sync step: by default the fingerprint tool is re-run incrementally on
-both sides so subsequent sync runs see the new state. Pass --no-refresh-after
-to skip this.
+Fingerprint refresh: by default each directory's .fingerprint is refreshed
+incrementally on both sides as soon as that directory finishes (bottom-up), so
+subsequent runs see the new state and an interrupted run still leaves every
+completed directory current. Pass --no-refresh-after to write no fingerprints.
 """
 
 from __future__ import annotations
@@ -264,8 +265,19 @@ def _dir_entries_match(a: Optional[dict], b: Optional[dict]) -> bool:
 
 
 def sync_directory(
-    conn: SSHConn, local_dir: Path, remote_dir: str, verbose: bool
+    conn: SSHConn,
+    local_dir: Path,
+    remote_dir: str,
+    verbose: bool,
+    refresher: Optional[RemoteFingerprinter] = None,
 ) -> None:
+    """Sync one directory and recurse.
+
+    When refresher is given, each directory's .fingerprint is refreshed on both
+    sides as soon as that directory (and its children) finish, so an interrupted
+    run still leaves every completed directory current. When it is None no
+    fingerprints are written (the --no-refresh-after path).
+    """
     local_fp = load_local_fingerprint(local_dir)
     remote_fp = load_remote_fingerprint(conn, remote_dir)
 
@@ -318,7 +330,15 @@ def sync_directory(
                 file=sys.stderr,
             )
             continue
-        sync_directory(conn, sub_local, sub_remote, verbose)
+        sync_directory(conn, sub_local, sub_remote, verbose, refresher)
+
+    # Children are now current (recursed above, or identical-skipped) and any
+    # files pulled into this directory sit on disk, so record this directory's
+    # new state on both sides. Bottom-up + per-directory means an interrupted
+    # run still leaves every finished directory's fingerprint usable next run.
+    if refresher is not None:
+        refresh_local_directory(local_dir, verbose)
+        refresher.refresh_one(remote_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +347,7 @@ def sync_directory(
 
 
 def refresh_local_fingerprints(local_dir: Path, verbose: bool) -> None:
+    """Recursively refresh every local .fingerprint under local_dir."""
     if verbose:
         print(f"refresh local fingerprints under {local_dir}", file=sys.stderr)
     fingerprint.process_directory(
@@ -334,23 +355,66 @@ def refresh_local_fingerprints(local_dir: Path, verbose: bool) -> None:
     )
 
 
-def refresh_remote_fingerprints(conn: SSHConn, remote_dir: str, verbose: bool) -> None:
-    """Stream fingerprint.py to the remote via stdin and run it there.
+def refresh_local_directory(local_dir: Path, verbose: bool) -> None:
+    """Refresh just this one local directory's .fingerprint (no recursion).
 
-    Avoids assuming fingerprint.py is already deployed on the remote.
+    Children's .fingerprint files are assumed already current (sync_directory
+    refreshes bottom-up), so this only rehashes files newly landed in this
+    directory and re-reads the children's pointers.
     """
-    script_path = Path(__file__).resolve().parent / "fingerprint.py"
-    script = script_path.read_text(encoding="utf-8")
-    cmd_str = f"python3 - {shlex.quote(remote_dir)} --incremental"
-    if verbose:
-        print(f"refresh remote fingerprints under {remote_dir}", file=sys.stderr)
-    try:
-        conn.run_with_stdin(cmd_str, script)
-    except subprocess.CalledProcessError as exc:
-        print(
-            f"warning: remote fingerprint refresh failed (exit {exc.returncode})",
-            file=sys.stderr,
+    fingerprint.process_directory(
+        local_dir, full_recompute=False, prune=False, verbose=verbose,
+        recurse=False,
+    )
+
+
+class RemoteFingerprinter:
+    """Refresh individual remote directories' .fingerprint files on demand.
+
+    fingerprint.py is streamed to a temp file on the remote once (lazily, on
+    the first refresh), then invoked per directory with --incremental
+    --no-recurse so each call only rehashes the files just transferred into
+    that one directory. cleanup() removes the deployed script. This avoids
+    assuming fingerprint.py is already present on the remote and avoids
+    re-streaming it for every directory.
+    """
+
+    def __init__(self, conn: SSHConn, verbose: bool = False) -> None:
+        self.conn = conn
+        self.verbose = verbose
+        self._remote_script: Optional[str] = None
+
+    def _ensure_deployed(self) -> None:
+        if self._remote_script is not None:
+            return
+        script = (Path(__file__).resolve().parent / "fingerprint.py").read_text(
+            encoding="utf-8"
         )
+        path = self.conn.run("mktemp").stdout.strip()
+        self.conn.run_with_stdin(f"cat > {shlex.quote(path)}", script)
+        self._remote_script = path
+
+    def refresh_one(self, remote_dir: str) -> None:
+        try:
+            self._ensure_deployed()
+            cmd = (
+                f"python3 {shlex.quote(self._remote_script)} "
+                f"{shlex.quote(remote_dir)} --incremental --no-recurse"
+            )
+            if self.verbose:
+                print(f"refresh remote fingerprint: {remote_dir}", file=sys.stderr)
+            self.conn.run(cmd)
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"warning: remote fingerprint refresh failed for {remote_dir}: "
+                f"{(exc.stderr or '').strip()}",
+                file=sys.stderr,
+            )
+
+    def cleanup(self) -> None:
+        if self._remote_script is not None:
+            self.conn.run(f"rm -f -- {shlex.quote(self._remote_script)}", check=False)
+            self._remote_script = None
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +445,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--no-refresh-after", action="store_true",
         help=(
-            "Do not refresh .fingerprint files on either side after the sync "
-            "finishes. By default both sides are refreshed incrementally so "
-            "subsequent runs see the new state."
+            "Do not write .fingerprint files on either side during the sync. By "
+            "default each directory is refreshed incrementally on both sides as "
+            "soon as it finishes, so subsequent runs (and interrupted ones) see "
+            "the new state."
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -398,6 +463,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         refresh_local_fingerprints(local_dir, args.verbose)
 
     conn = SSHConn(args.host, port=args.port)
+    refresher = (
+        None if args.no_refresh_after else RemoteFingerprinter(conn, args.verbose)
+    )
     try:
         try:
             ensure_remote_dir(conn, args.remote_dir)
@@ -408,11 +476,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        sync_directory(conn, local_dir, args.remote_dir, args.verbose)
-        if not args.no_refresh_after:
-            refresh_remote_fingerprints(conn, args.remote_dir, args.verbose)
-            refresh_local_fingerprints(local_dir, args.verbose)
+        sync_directory(conn, local_dir, args.remote_dir, args.verbose, refresher)
     finally:
+        if refresher is not None:
+            refresher.cleanup()
         conn.close()
     return 0
 
