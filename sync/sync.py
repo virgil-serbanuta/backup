@@ -83,7 +83,15 @@ class SSHConn:
         return args
 
     def _scp_args(self, src: str, dst: str) -> list[str]:
-        args = ["scp", *self._mux, "-q"]
+        # -O forces the legacy SCP protocol on every OpenSSH version. We rely
+        # on it because it has a single, predictable quoting rule: the remote
+        # path is handed to the remote login shell, so callers shlex.quote the
+        # remote half of any host:path argument. (SFTP-mode scp, the >=9.0
+        # default, would instead treat those quotes as literal filename bytes.)
+        # -T disables strict filename checking, which would otherwise reject
+        # our quoted request with "protocol error: filename does not match
+        # request" because the shell strips the quotes before echoing the name.
+        args = ["scp", *self._mux, "-O", "-T", "-q"]
         if self.port is not None:
             args += ["-P", str(self.port)]
         args += [src, dst]
@@ -98,16 +106,17 @@ class SSHConn:
         )
 
     def upload(self, local: Path, remote: str) -> None:
-        # Modern scp uses SFTP under the hood and passes the remote path
-        # verbatim — no shell expansion, so do NOT shlex.quote here.
-        target = f"{self.host}:{remote}"
+        # Legacy-protocol scp (forced via -O in _scp_args) runs the remote half
+        # through the remote login shell, so quote it or names containing
+        # spaces, ';', '()', quotes, etc. get mangled by that shell.
+        target = f"{self.host}:{shlex.quote(remote)}"
         subprocess.run(
             self._scp_args(str(local), target),
             check=True, text=True, capture_output=True,
         )
 
     def download(self, remote: str, local: Path) -> None:
-        source = f"{self.host}:{remote}"
+        source = f"{self.host}:{shlex.quote(remote)}"
         subprocess.run(
             self._scp_args(source, str(local)),
             check=True, text=True, capture_output=True,
