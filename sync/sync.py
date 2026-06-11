@@ -331,6 +331,7 @@ def sync_directory(
     finished directory current. When refresher is None no fingerprints are
     written (the --no-refresh-after path).
     """
+    print(f"Starting sync {local_dir}", file=sys.stderr, flush=True, end="")
     local_fp = load_local_fingerprint(local_dir)
     remote_fp = load_remote_fingerprint(conn, remote_dir)
 
@@ -368,6 +369,7 @@ def sync_directory(
         if pull_file(conn, remote_dir, name, local_dir, verbose):
             local_changed = True
 
+    print(f"Subdir processing", file=sys.stderr, flush=True)
     for name in sorted(set(local_dirs) | set(remote_dirs)):
         if name in local_files or name in remote_files:
             # The same name appears as a file on one side and a directory on
