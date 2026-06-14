@@ -590,6 +590,52 @@ class TestPerDirectoryRefresh:
         assert not (remote / FP).exists()
         assert not (remote / "a" / FP).exists()
 
+    def test_empty_local_only_subdir_gets_remote_fingerprint(
+        self, tmp_path: Path
+    ) -> None:
+        """An empty subdirectory that exists only locally is created on the
+        remote AND gets its own .fingerprint, even though no files are pushed
+        into it. The parent then records a matching dir pointer on both sides,
+        and the two empty-dir fingerprints are byte-identical so the pointers
+        agree (letting the subtree be skipped on later runs)."""
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"empty": {}})
+        fingerprint_tree(local)
+
+        _run_sync(local, remote)
+
+        assert (remote / "empty").is_dir()
+        assert (remote / "empty" / FP).exists()
+        assert "empty" in read_fp(remote)["dirs"]
+        assert "empty" in read_fp(local)["dirs"]
+        assert (remote / "empty" / FP).read_bytes() == (local / "empty" / FP).read_bytes()
+
+    def test_empty_local_only_subdir_subtree_skipped_on_second_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once the empty subdir is fingerprinted on both sides, its parent
+        pointers match, so a second run skips the subtree without recursing or
+        refreshing anything."""
+        local = tmp_path / "local"
+        remote = tmp_path / "remote"
+        make_tree(local, {"empty": {}})
+        fingerprint_tree(local)
+        _run_sync(local, remote)  # first run establishes both fingerprints
+
+        calls: list[str] = []
+        real = sync_tool.RemoteFingerprinter.refresh_one
+
+        def spy(self, remote_dir):
+            calls.append(remote_dir)
+            return real(self, remote_dir)
+
+        monkeypatch.setattr(sync_tool.RemoteFingerprinter, "refresh_one", spy)
+
+        _run_sync(local, remote)  # second run: nothing to do
+
+        assert calls == []
+
 
 @needs_ssh
 @needs_remote_python

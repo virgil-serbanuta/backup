@@ -159,22 +159,29 @@ def load_local_fingerprint(directory: Path) -> dict:
     return fingerprint.load_fingerprint(fp)
 
 
-def load_remote_fingerprint(conn: SSHConn, remote_dir: str) -> dict:
+def load_remote_fingerprint(conn: SSHConn, remote_dir: str) -> tuple[dict, bool]:
+    """Return (fingerprint, present).
+
+    `present` is True only when a valid fingerprint was loaded. Missing,
+    unreadable, or malformed remote fingerprints all yield an empty fingerprint
+    with present=False, signalling the caller that this remote directory has no
+    usable .fingerprint yet and one should be written.
+    """
     fp_path = posixpath.join(remote_dir, FINGERPRINT_FILENAME)
     # Missing remote fingerprint is the normal case for an empty remote, so
     # treat any non-zero exit as "no fingerprint here" rather than an error.
     result = conn.run(f"cat -- {shlex.quote(fp_path)}", check=False)
     if result.returncode != 0:
-        return fingerprint.empty_fingerprint()
+        return fingerprint.empty_fingerprint(), False
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return fingerprint.empty_fingerprint()
+        return fingerprint.empty_fingerprint(), False
     if not isinstance(data, dict):
-        return fingerprint.empty_fingerprint()
+        return fingerprint.empty_fingerprint(), False
     files = data.get("files") if isinstance(data.get("files"), dict) else {}
     dirs = data.get("dirs") if isinstance(data.get("dirs"), dict) else {}
-    return {"files": files, "dirs": dirs}
+    return {"files": files, "dirs": dirs}, True
 
 
 # ---------------------------------------------------------------------------
@@ -325,15 +332,19 @@ def sync_directory(
     child dirties both ancestors' dir pointers on the side that changed.
 
     When refresher is given, each directory's .fingerprint is refreshed as soon
-    as that directory (and its children) finish — but only on the side that
-    actually changed, so a pull-only or unchanged directory costs no refresh.
-    Bottom-up + per-directory means an interrupted run still leaves every
-    finished directory current. When refresher is None no fingerprints are
+    as that directory (and its children) finish — on the side that actually
+    changed, or on a side that has no usable .fingerprint yet (so a freshly
+    created, even empty, directory still gets one). A pull-only side whose
+    fingerprint is already current costs no refresh. Writing a .fingerprint
+    counts as a change to that side, so the returned flag dirties the parent's
+    pointer. Bottom-up + per-directory means an interrupted run still leaves
+    every finished directory current. When refresher is None no fingerprints are
     written (the --no-refresh-after path).
     """
     print(f"Starting sync {local_dir}", file=sys.stderr, flush=True, end="")
     local_fp = load_local_fingerprint(local_dir)
-    remote_fp = load_remote_fingerprint(conn, remote_dir)
+    local_fp_present = (local_dir / FINGERPRINT_FILENAME).is_file()
+    remote_fp, remote_fp_present = load_remote_fingerprint(conn, remote_dir)
 
     local_files = local_fp.get("files", {})
     remote_files = remote_fp.get("files", {})
@@ -410,16 +421,22 @@ def sync_directory(
         local_changed = local_changed or sub_local_changed
         remote_changed = remote_changed or sub_remote_changed
 
-    # Record this directory's new state, but only on the side that actually
-    # changed: a changed child (or a pull/push here) dirties that side's dir
-    # pointer, so refreshing it keeps the fingerprint current; an untouched side
-    # is already current and needs no work. Refreshing bottom-up + per-directory
-    # leaves every finished directory usable even if the run is interrupted.
+    # Record this directory's new state, but only on the side that needs it: a
+    # changed child (or a pull/push here) dirties that side's dir pointer, and a
+    # side with no usable .fingerprint yet (e.g. a freshly-created remote dir,
+    # including an empty one that received no pushes) must get one written so the
+    # parent can record a matching pointer and skip the subtree next run. Writing
+    # a .fingerprint changes it, so we report that side as changed to dirty the
+    # parent's pointer. An untouched side that already has a current fingerprint
+    # needs no work. Refreshing bottom-up + per-directory leaves every finished
+    # directory usable even if the run is interrupted.
     if refresher is not None:
-        if local_changed:
+        if local_changed or not local_fp_present:
             refresh_local_directory(local_dir, verbose)
-        if remote_changed:
+            local_changed = True
+        if remote_changed or not remote_fp_present:
             refresher.refresh_one(remote_dir)
+            remote_changed = True
 
     return local_changed, remote_changed
 
